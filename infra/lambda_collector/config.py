@@ -31,6 +31,13 @@ HTTP_TIMEOUT_SECONDS: Final[tuple[float, float]] = (3.05, 7.0)
 # poll is only 60 seconds away, and retrying inside the invocation would eat the
 # timeout budget of the feeds that have not been fetched yet.
 
+# Static GTFS gets its own, much longer read timeout. It runs on a separate daily
+# schedule, so it does not share the 60s budget above — and it could not fit in
+# it anyway: the bus bundle is ~50 MB, against ~1 MB for the largest realtime
+# feed. The next static poll is 24 hours away rather than 60 seconds, so giving
+# a slow transfer room to finish is worth more here than failing fast.
+STATIC_HTTP_TIMEOUT_SECONDS: Final[tuple[float, float]] = (3.05, 120.0)
+
 # --------------------------------------------------------------------------
 # Archive format
 # --------------------------------------------------------------------------
@@ -74,9 +81,10 @@ class FeedSpec:
 # WMATA also publishes service-alert feeds at `rail-gtfsrt-alerts.pb` and
 # `bus-gtfsrt-alerts.pb` (both verified to exist). They are deliberately not
 # collected yet — alerts are low-cardinality and change slowly, so polling them
-# once a minute would mostly archive duplicates. Static GTFS and the Bus & Rail
-# Crowding feed are also out of scope for the collector; the ETL fetches those
-# on demand rather than snapshotting them every minute.
+# once a minute would mostly archive duplicates. The Bus & Rail Crowding feed is
+# also out of scope; the ETL fetches it on demand rather than snapshotting it
+# every minute. Static GTFS *is* archived, but on a daily schedule — see
+# STATIC_FEEDS below.
 FEEDS: Final[tuple[FeedSpec, ...]] = (
     FeedSpec(
         name="rail_vehicle_positions",
@@ -100,6 +108,51 @@ FEEDS: Final[tuple[FeedSpec, ...]] = (
     ),
 )
 
+# --------------------------------------------------------------------------
+# Static GTFS
+# --------------------------------------------------------------------------
+# The scheduled timetable — the "scheduled" half of every actual-vs-scheduled
+# delta the ETL computes. Archived daily rather than per-minute because it
+# changes at most weekly.
+#
+# Archiving it at all is not optional, and this is the reason: static `trip_id`
+# is a composite, `{scheduled_trip_id}_{schedule_version}`, and WMATA serves
+# only the *current* bundle. Rail's window is about ten days (feed_info.txt
+# reports feed_start_date/feed_end_date); after that the bundle is gone for
+# good. A version bump happens because the timetable changed, so joining
+# archived realtime against a later bundle can hand back the new scheduled time
+# against the old actual — a wrong delay that looks entirely plausible. Missing
+# a day here silently and permanently corrupts that day's labels.
+#
+# These reuse FeedSpec rather than defining a parallel type: the fields and the
+# `url` property are identical, and `name` plays the same role — top-level
+# archive partition and filename stem.
+STATIC_FEEDS: Final[tuple[FeedSpec, ...]] = (
+    FeedSpec(
+        name="rail",
+        path="rail-gtfs-static.zip",
+        description="Rail scheduled timetable — ~3 MB, feed window ~10 days.",
+    ),
+    FeedSpec(
+        name="bus",
+        path="bus-gtfs-static.zip",
+        description="Bus scheduled timetable — ~50 MB, feed window ~3 months.",
+    ),
+)
+
+# Members every bundle must contain to be considered valid. This is the
+# *intersection* of what the two modes actually ship, not the GTFS spec's list:
+# rail publishes no `calendar.txt` (only `calendar_dates.txt`) and no
+# `feed_version`, while bus publishes both. Requiring `calendar.txt` here would
+# reject every rail bundle.
+STATIC_REQUIRED_MEMBERS: Final[tuple[str, ...]] = (
+    "trips.txt",
+    "stop_times.txt",
+    "stops.txt",
+    "routes.txt",
+    "feed_info.txt",
+)
+
 
 class ConfigError(RuntimeError):
     """Raised when required environment variables are missing or malformed."""
@@ -111,6 +164,7 @@ class CollectorConfig:
 
     wmata_api_key: str
     s3_prefix: str
+    s3_static_prefix: str
     s3_bucket: str | None = None
     local_output_dir: str | None = None
 
@@ -132,6 +186,7 @@ class CollectorConfig:
         api_key = _clean(source.get("WMATA_API_KEY"))
         bucket = _clean(source.get("S3_BUCKET"))
         prefix = _clean(source.get("S3_PREFIX"))
+        static_prefix = _clean(source.get("S3_STATIC_PREFIX"))
         local_dir = _clean(source.get("LOCAL_OUTPUT_DIR"))
 
         missing = ["WMATA_API_KEY"] if not api_key else []
@@ -151,9 +206,26 @@ class CollectorConfig:
             )
 
         assert api_key is not None  # narrowed by the `missing` check above
+        raw = _normalize_prefix(prefix or "raw/")
+        static = _normalize_prefix(static_prefix or "static/")
+
+        # The raw prefix carries a 90-day expiry lifecycle rule. Static bundles
+        # nested under it would be deleted on that clock, and because WMATA only
+        # serves the current bundle they could never be re-fetched — the archive
+        # would lose the ability to compute correct deltas for anything older
+        # than the current feed window. Cheap to catch here; unrecoverable if
+        # discovered later.
+        if static.startswith(raw) or raw.startswith(static):
+            raise ConfigError(
+                f"S3_STATIC_PREFIX ({static!r}) and S3_PREFIX ({raw!r}) must not "
+                "nest. The raw prefix expires after 90 days and static GTFS "
+                "bundles cannot be re-fetched once WMATA rotates them."
+            )
+
         return cls(
             wmata_api_key=api_key,
-            s3_prefix=_normalize_prefix(prefix or "raw/"),
+            s3_prefix=raw,
+            s3_static_prefix=static,
             s3_bucket=bucket,
             local_output_dir=local_dir,
         )

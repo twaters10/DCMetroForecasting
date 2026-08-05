@@ -1,0 +1,19 @@
+# Repo-level development dependencies: tests and the local ETL.
+#
+# Distinct from infra/lambda_collector/requirements-dev.txt, which is scoped to
+# the collector and inherits that component's runtime pins. Nothing here is ever
+# bundled into the Lambda zip.
+
+pytest
+
+# Static GTFS bundles and realtime protobuf are read by the tests and the ETL.
+# Pinned to match the collector's runtime versions so a bundle that parses in
+# Lambda parses identically here.
+gtfs-realtime-bindings==2.2.0
+protobuf==7.35.1
+requests==2.34.2
+
+python-dotenv
+boto3
+black
+ruff
