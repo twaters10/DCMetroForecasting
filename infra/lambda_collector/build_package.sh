@@ -38,8 +38,12 @@ TARGET_ARCH_TOKEN="aarch64" # what a correct binary wheel tag must contain
 
 # Modules that live at the zip root alongside the dependencies. The Lambda
 # handler is configured as `handler.lambda_handler`, and handler.py imports
-# `config` and `writers` as top-level modules, so all three must be at the root.
-HANDLER_MODULES=(handler.py config.py writers.py)
+# `config`, `writers` and `static_gtfs` as top-level modules, so all four must be
+# at the root. static_gtfs is imported lazily at runtime, which means omitting it
+# would break only the daily static task and leave the 60-second one healthy —
+# exactly the kind of partial failure that goes unnoticed, so the verification
+# step below checks for it like the rest.
+HANDLER_MODULES=(handler.py config.py writers.py static_gtfs.py)
 
 # Lambda limits for a direct (non-S3) upload.
 ZIP_LIMIT_MB=50

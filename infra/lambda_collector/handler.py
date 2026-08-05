@@ -1,8 +1,16 @@
-"""Lambda entrypoint: poll WMATA GTFS-realtime feeds, archive raw snapshots.
+"""Lambda entrypoint: poll WMATA feeds, archive raw snapshots.
 
-Invoked every 60 seconds by EventBridge Scheduler. Each invocation fetches every
-feed in `config.FEEDS`, validates that the payload is a parseable GTFS-realtime
-message, and writes the *original protobuf bytes* to a time-partitioned key.
+This function serves two schedules, selected by the event payload:
+
+- **realtime** (no `task` key) — every 60 seconds. Fetches every feed in
+  `config.FEEDS`, validates that the payload is a parseable GTFS-realtime
+  message, and writes the *original protobuf bytes* to a time-partitioned key.
+- **`{"task": "static_gtfs"}`** — once a day. Archives the scheduled timetable;
+  see `static_gtfs.py`.
+
+They share one deployment artifact because provisioning here is manual and
+out-of-repo, so a second function would double the console setup for no gain the
+dispatch below does not already give.
 
 Two design rules drive most of the code below:
 
@@ -49,6 +57,14 @@ _SESSION: Final[requests.Session] = requests.Session()
 # Built on first use and cached for the life of the container.
 _WRITER: SnapshotWriter | None = None
 
+# The event key that selects a task, and the one non-default value it accepts.
+# Anything else — including a missing key, which is what the 60-second schedule
+# sends — runs realtime collection. Defaulting to realtime rather than erroring is
+# deliberate: a malformed event should never cost a minute of irreplaceable
+# history.
+_TASK_KEY: Final[str] = "task"
+_STATIC_GTFS_TASK: Final[str] = "static_gtfs"
+
 
 @dataclass(frozen=True, slots=True)
 class FeedResult:
@@ -76,6 +92,16 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # share a partition and filename stem. That makes "the 12:03 snapshot" a
     # thing the ETL can join across feeds without a tolerance window.
     captured_at = datetime.now(UTC)
+
+    if (event or {}).get(_TASK_KEY) == _STATIC_GTFS_TASK:
+        # Imported here rather than at module scope so that nothing in the static
+        # path — including a bad import in it or its dependencies — can stop the
+        # realtime collection this function exists for. Realtime history cannot be
+        # backfilled; a static bundle can be re-fetched any time inside its feed
+        # window. The asymmetry is worth one deferred import.
+        from static_gtfs import collect_static_feeds
+
+        return collect_static_feeds(config, writer, captured_at, _SESSION)
 
     results = [_collect_feed(spec, config, writer, captured_at) for spec in FEEDS]
 

@@ -1,6 +1,7 @@
 """Run the collector against the live WMATA feeds without deploying anything.
 
-    python infra/lambda_collector/local_run.py
+    python infra/lambda_collector/local_run.py                     # realtime feeds
+    python infra/lambda_collector/local_run.py --task static-gtfs   # static GTFS
 
 Loads `.env` from the repo root, invokes `lambda_handler` with a stub event, and
 prints a per-feed summary. With `LOCAL_OUTPUT_DIR` set (the default in
@@ -9,10 +10,13 @@ it to exercise the real S3 write path with your own credentials.
 
 This exists so feed parsing can be confirmed before Lambda packaging enters the
 picture — they are separate failure modes and debugging them together is a trap.
+The `--task` flag matters for the same reason: the static path can be exercised
+end to end, against the live API and a real ~50 MB bundle, without a deploy.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -50,7 +54,21 @@ def _load_dotenv_fallback() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    # Hyphenated on the command line, underscored in the event — the event value
+    # is what EventBridge sends and must match handler._STATIC_GTFS_TASK exactly.
+    parser.add_argument(
+        "--task",
+        choices=("realtime", "static-gtfs"),
+        default="realtime",
+        help="which collection task to run (default: realtime)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 
     if not ENV_FILE.exists():
@@ -66,13 +84,23 @@ def main() -> int:
 
     from handler import lambda_handler
 
+    event: dict[str, object] = {"source": "local_run"}
+    if args.task == "static-gtfs":
+        event["task"] = "static_gtfs"
+        prefix_var = "S3_STATIC_PREFIX"
+        default_prefix = "static/"
+    else:
+        prefix_var = "S3_PREFIX"
+        default_prefix = "raw/"
+
     destination = os.environ.get("LOCAL_OUTPUT_DIR") or (
-        f"s3://{os.environ.get('S3_BUCKET')}/{os.environ.get('S3_PREFIX', '')}"
+        f"s3://{os.environ.get('S3_BUCKET')}/"
+        f"{os.environ.get(prefix_var, default_prefix)}"
     )
     # flush=True so this lands before the handler's log lines, which go to stderr.
-    print(f"Writing snapshots to: {destination}\n", flush=True)
+    print(f"Running task '{args.task}', writing to: {destination}\n", flush=True)
 
-    summary = lambda_handler({"source": "local_run"}, None)
+    summary = lambda_handler(event, None)
     print("\n" + json.dumps(summary, indent=2))
 
     # Non-zero exit if any feed failed, so this is usable as a smoke check.

@@ -9,13 +9,28 @@ modes worth debugging separately.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
+
+# What the realtime snapshots are: gzipped protobuf. Static GTFS bundles override
+# this with `application/zip`.
+DEFAULT_CONTENT_TYPE: Final[str] = "application/gzip"
 
 
 class SnapshotWriter(Protocol):
-    """Writes one snapshot and returns a human-readable destination."""
+    """Writes one snapshot and returns a human-readable destination.
 
-    def write(self, key: str, payload: bytes) -> str: ...
+    `content_type` and `metadata` exist for the static GTFS bundles, which are
+    zips rather than gzipped protobuf and carry a feed window worth recording on
+    the object. Both are optional so the realtime call sites stay unchanged.
+    """
+
+    def write(
+        self,
+        key: str,
+        payload: bytes,
+        content_type: str = DEFAULT_CONTENT_TYPE,
+        metadata: dict[str, str] | None = None,
+    ) -> str: ...
 
 
 class S3Writer:
@@ -40,19 +55,26 @@ class S3Writer:
         self._bucket = bucket
         self._client = boto3.client("s3")
 
-    def write(self, key: str, payload: bytes) -> str:
-        # `ContentType: application/gzip` and deliberately NOT
-        # `ContentEncoding: gzip`. ContentEncoding invites transparent
-        # decompression by some readers (a presigned URL fetched with `requests`,
-        # or CloudFront) while boto3's get_object does not decompress at all — so
-        # the same object would hand back different bytes depending on how it was
-        # read. Treating it as an opaque gzip blob keeps bytes-in == bytes-out for
-        # every reader, and the ETL decompresses explicitly.
+    def write(
+        self,
+        key: str,
+        payload: bytes,
+        content_type: str = DEFAULT_CONTENT_TYPE,
+        metadata: dict[str, str] | None = None,
+    ) -> str:
+        # A ContentType but deliberately NEVER `ContentEncoding`. ContentEncoding
+        # invites transparent decompression by some readers (a presigned URL
+        # fetched with `requests`, or CloudFront) while boto3's get_object does not
+        # decompress at all — so the same object would hand back different bytes
+        # depending on how it was read. Treating every object as an opaque
+        # compressed blob keeps bytes-in == bytes-out for every reader, and the
+        # ETL decompresses explicitly. This holds for the zip bundles too.
         self._client.put_object(
             Bucket=self._bucket,
             Key=key,
             Body=payload,
-            ContentType="application/gzip",
+            ContentType=content_type,
+            **({"Metadata": metadata} if metadata else {}),
         )
         return f"s3://{self._bucket}/{key}"
 
@@ -67,7 +89,19 @@ class LocalWriter:
     def __init__(self, root: str | Path) -> None:
         self._root = Path(root).expanduser().resolve()
 
-    def write(self, key: str, payload: bytes) -> str:
+    def write(
+        self,
+        key: str,
+        payload: bytes,
+        content_type: str = DEFAULT_CONTENT_TYPE,
+        metadata: dict[str, str] | None = None,
+    ) -> str:
+        # Both are accepted and ignored: a filesystem has nowhere to put them, and
+        # the local writer exists to verify fetch/parse/key logic, not S3
+        # attributes. The key already carries everything the ETL needs to resolve
+        # a bundle, so nothing load-bearing is lost here.
+        del content_type, metadata
+
         path = self._root / key
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
