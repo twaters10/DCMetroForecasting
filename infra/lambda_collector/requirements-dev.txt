@@ -1,0 +1,7 @@
+# Local development only — never bundled into the deployment zip.
+-r requirements.txt
+
+python-dotenv
+boto3
+black
+ruff

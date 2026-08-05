@@ -1,0 +1,15 @@
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.isort]
+# The Lambda zip puts every collector module at its root, so they are imported
+# as top-level names. Declare them first-party or isort groups them as external.
+known-first-party = ["config", "handler", "writers"]

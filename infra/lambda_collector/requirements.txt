@@ -1,0 +1,15 @@
+# Runtime dependencies bundled into the Lambda deployment zip.
+#
+# boto3 is intentionally absent: the Lambda Python runtime already provides it.
+# Bundling it bloats the zip and can shadow the runtime's newer version with an
+# older one. build_package.sh fails the build if boto3 ever appears here.
+#
+# Versions are pinned, including the transitive `protobuf`, because that is the
+# one architecture-sensitive wheel in the tree. An unpinned rebuild months from
+# now could pull a protobuf major version whose generated-code contract differs
+# from gtfs-realtime-bindings' — and the collector would fail at import time in
+# Lambda, losing history that cannot be backfilled. These exact versions are
+# verified against the live WMATA feeds.
+gtfs-realtime-bindings==2.2.0
+protobuf==7.35.1
+requests==2.34.2

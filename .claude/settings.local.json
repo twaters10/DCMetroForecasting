@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/tawate/Documents/06_Personal_Data_Projects/DCMetroForecasting log --oneline -5)",
+      "WebFetch(domain:developer.wmata.com)",
+      "WebSearch",
+      "Read(//Library/Frameworks/Python.framework/Versions/**)",
+      "Read(//opt/homebrew/bin/**)",
+      "Read(//usr/local/bin/**)",
+      "Bash(command -v uv pyenv conda)"
+    ]
+  }
+}
