@@ -33,6 +33,22 @@ AWS credentials in the repository at all. The alternative — `AWS_ACCESS_KEY_ID
 `AWS_SECRET_ACCESS_KEY` as repo secrets — means a permanent credential that has to be
 rotated by hand and is one misconfigured workflow away from being printed to a log.
 
+## Two policies, two different editors — read this before step 2
+
+A role carries two policy documents and the console asks for them in different places.
+Mixing them up is the easiest mistake here, and IAM's error messages name the *symptom*
+rather than the cause.
+
+| | **Trust** policy | **Permissions** policy |
+| --- | --- | --- |
+| Answers | *who* may assume the role | *what* the role may do |
+| `Principal` | required | **forbidden** |
+| `Resource` | absent | **required** |
+| Where | generated for you by the Web identity screen; editable afterwards under the role's **Trust relationships** tab | the wizard's **Add permissions** step (step 3 below) |
+
+The single rule: **`Principal` and `Resource` never appear in the same document.** If a
+policy has both, or neither, it is in the wrong editor.
+
 ## 1. Add GitHub as an IAM identity provider
 
 AWS console → IAM → Identity providers → Add provider → **OpenID Connect**
@@ -44,12 +60,33 @@ AWS console → IAM → Identity providers → Add provider → **OpenID Connect
 
 One per account. Skip if it already exists.
 
-## 2. Create the role the workflow assumes
+## 2. Create the role and confirm its trust policy
 
-IAM → Roles → Create role → **Web identity**, selecting the provider above.
+IAM → Roles → Create role → **Web identity**, selecting the provider above, then fill in:
 
-Then replace the trust policy with this. The `sub` condition is the security boundary:
-without it, **any** GitHub repository in the world could assume this role.
+| Field | Value |
+| --- | --- |
+| Identity provider | `token.actions.githubusercontent.com` |
+| Audience | `sts.amazonaws.com` |
+| GitHub organization | `twaters10` |
+| GitHub repository | `DCMetroForecasting` |
+| GitHub branch | leave as `*` |
+
+"GitHub organization" is the account **owner** — the first path segment of the repo URL.
+A personal username goes there exactly as an org name would; there is no separate field
+for it.
+
+**Fill in the repository.** Left as `*` the policy becomes `repo:twaters10/*`, letting
+any repo you own — including anything you fork later — assume this role.
+
+**There is nothing to paste at this step.** Those three fields *generate* the trust
+policy. The JSON below is what you should expect to see afterwards under the role's
+**Trust relationships** tab — a verification target, not an input. Pasting it into the
+next screen produces the two errors in *Troubleshooting the setup* at the end of this
+document.
+
+The `sub` condition is the security boundary: without it, **any** GitHub repository in
+the world could assume this role.
 
 ```json
 {
@@ -77,7 +114,10 @@ To restrict further to the default branch only, replace the `sub` value with
 `workflow_dispatch` runs from other branches, which is usually what you want for a job
 that writes to shared storage.
 
-## 3. Attach a least-privilege policy
+## 3. Attach the permissions policy — the wizard's "Add permissions" step
+
+**This** is the screen you paste JSON into: *Add permissions* → *Create policy* → the
+**JSON** tab. Note it has `Resource` and no `Principal`, the opposite of step 2.
 
 The ETL reads `raw/` and `static/`, and writes `processed/`. It has no reason to touch
 anything else, and specifically no reason to be able to delete `raw/` — that data is a
@@ -153,6 +193,32 @@ What a healthy first run looks like:
   `nothing outstanding — up to date`. **The latter is success, not a no-op failure**: a
   service day only becomes eligible once it has closed at 04:00 UTC the next day.
 - `Report what is now in S3` — one `.parquet` per `service_date=` partition
+
+## Troubleshooting the setup
+
+**`Unsupported Principal: The policy type IDENTITY_POLICY does not support the Principal
+element.`** together with **`Missing Resource: Add a Resource or NotResource element to
+the policy statement.`**
+
+The step-2 trust policy has been pasted into the step-3 permissions editor. Paste the S3
+policy from step 3 there instead; the trust policy needs no pasting at all. Nothing is
+wrong with the account or the JSON — see the table near the top of this document.
+
+**`Invalid principal in policy`** when saving a trust policy
+
+The OIDC provider named in `Federated` does not exist in this account, or the account id
+is wrong. Check both:
+
+```bash
+aws sts get-caller-identity --query Account --output text   # expect 767237556899
+aws iam list-open-id-connect-providers
+```
+
+**The role saves, but the workflow fails at `Configure AWS credentials`**
+
+That is a run-time failure rather than a setup one — `runbook.txt` §7 covers it. The
+usual causes are an unset `AWS_ROLE_ARN` repo variable, a `sub` condition that does not
+match this repo, or a missing `permissions: id-token: write` in the workflow.
 
 ## Operating notes
 
