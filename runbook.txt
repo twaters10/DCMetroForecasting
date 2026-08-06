@@ -260,7 +260,7 @@
 
 
 ================================================================================
- 5A. AUTOMATED OPERATION (the daily schedule)
+ 5A. AUTOMATED OPERATION (GitHub Actions)
 ================================================================================
 
  The scheduled job is `src.etl.catchup`, not the pipeline directly, and it is
@@ -274,44 +274,46 @@
    - Dates the archive cannot fully cover are never proposed, including the
      collector's first partial day.
 
- Trigger: launchd, not cron. cron silently skips a job whose time passed while
- the Mac was asleep; launchd runs a missed StartCalendarInterval job at next
- wake. Scheduled for 09:00 local, when the machine is usually awake.
+ WHERE IT RUNS: GitHub Actions, .github/workflows/etl-daily.yml, 07:00 UTC daily
+ plus manual workflow_dispatch. One-time AWS OIDC and repo-variable setup is in
+ docs/ci-setup.md.
 
- 5A.1  Install the schedule
+ WHY NOT A LOCAL SCHEDULE: a launchd agent was built and does not work here.
+ macOS TCC denies a LaunchAgent read access under ~/Documents, where this repo
+ lives, so the job fails with exit 126 "Operation not permitted" before it
+ starts. Probed: chdir and stat are allowed, listing and reading contents are
+ not. The alternatives were moving the repo out of ~/Documents or granting Full
+ Disk Access to /bin/bash; CI was chosen instead and also removes the
+ laptop-asleep failure mode. Full detail in docs/ci-setup.md.
 
-   REPO="$(pwd)"
-   mkdir -p ~/Library/LaunchAgents
-   sed "s|__REPO_ROOT__|$REPO|g" infra/launchd/com.metropulse.etl.plist \
-     > ~/Library/LaunchAgents/com.metropulse.etl.plist
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.metropulse.etl.plist
+ 5A.1  Check on it
 
- 5A.2  Verify
+   GitHub -> Actions -> etl-daily. Green with "nothing outstanding" is a healthy
+   run, not a failure: the current service day has not closed yet.
 
-   launchctl print gui/$(id -u)/com.metropulse.etl | head -20
-   launchctl kickstart -k gui/$(id -u)/com.metropulse.etl    # force a run now
-   tail -f logs/etl-$(date +%Y-%m).log
+ 5A.2  Force a run
 
- 5A.3  Uninstall
+   Actions -> etl-daily -> Run workflow. Inputs: mode, lookback_days, force.
 
-   launchctl bootout gui/$(id -u)/com.metropulse.etl
-   rm ~/Library/LaunchAgents/com.metropulse.etl.plist
+ 5A.3  Logs
 
- 5A.4  Logs
+   The Actions run log is the primary record. The same output is also uploaded
+   as an `etl-log-<run_id>` artifact, retained 30 days.
 
-   logs/etl-YYYY-MM.log     the run log, appended, one section per run
-   logs/launchd.{out,err}.log
-                            only catches failures BEFORE the wrapper starts
-                            (bad path, missing interpreter). Normally empty.
+ 5A.4  Reprocess a date after changing derivation logic
 
- 5A.5  Reprocess a date after changing derivation logic
-
-   python -m src.etl.catchup --force --lookback-days 30
-
-      or, for one date, delete its partition from S3 and let the next run pick
-      it up:
+   Run the workflow with force = true, or delete the partition and let the next
+   run pick it up:
 
    aws s3 rm s3://<bucket>/processed/segments/service_date=2026-08-05/ --recursive
+
+ 5A.5  !! THE MOST LIKELY WAY THIS DIES
+
+   GitHub DISABLES scheduled workflows after 60 days of repository inactivity,
+   silently, with no notification. For a project that goes quiet between pushes
+   this is the realistic failure mode. Check the Actions tab monthly, or push
+   something occasionally. Recovery is re-enabling and running once - but only
+   while the source data is still inside its 90-day retention.
 
 
 ================================================================================
@@ -416,20 +418,30 @@
            session only to fail on missing input.
  CHECK     python -m pytest tests/test_etl.py -k before_the_archive
 
- SYMPTOM   launchd job never runs
- CHECK     launchctl print gui/$(id -u)/com.metropulse.etl
- CAUSE 1   Not loaded. Re-run the bootstrap in 5A.1.
- CAUSE 2   Mac asleep at 09:00. launchd runs it at next wake - confirm by the
-           timestamp in logs/etl-YYYY-MM.log rather than assuming it was
-           skipped. Nothing is lost either way; the next run catches up.
- CAUSE 3   The wrapper died before logging. Check logs/launchd.err.log, which
-           is otherwise empty.
+ SYMPTOM   The scheduled workflow stopped running entirely
+ CAUSE     GitHub disables scheduled workflows after 60 days of repo inactivity.
+ CHECK     GitHub -> Actions -> etl-daily. A disabled schedule says so at the top.
+ FIX       Re-enable it, then run once manually to catch up.
 
- SYMPTOM   launchd job runs but fails with credential or Java errors
- CAUSE     launchd starts jobs with almost no environment - no AWS_PROFILE, no
-           JAVA_HOME, no useful PATH, cwd of /.
- FIX       scripts/run_etl_daily.sh sets all of these. Run it directly to
-           reproduce: ./scripts/run_etl_daily.sh --dry-run
+ SYMPTOM   CI fails at "Configure AWS credentials"
+ CAUSE 1   Repo variable AWS_ROLE_ARN unset or wrong.
+ CAUSE 2   The role's trust policy does not match this repo. The `sub` condition
+           must be repo:twaters10/DCMetroForecasting:* (or a specific ref).
+ CAUSE 3   `permissions: id-token: write` missing from the workflow - without it
+           no OIDC token is issued and the error mentions loading credentials
+           rather than OIDC.
+ FIX       docs/ci-setup.md steps 1-4.
+
+ SYMPTOM   CI fails with AccessDenied writing processed/
+ CAUSE     The role policy lacks s3:DeleteObject on processed/*. It is required,
+           not optional: sync_partitions clears a partition prefix before
+           re-uploading so stale part files cannot be read as extra rows.
+ FIX       docs/ci-setup.md step 3.
+
+ SYMPTOM   A local run fails with "Missing required environment variable: S3_BUCKET"
+ CAUSE     No .env at the repo root. EtlConfig.from_env() loads it automatically
+           with override=False, so a real environment variable still wins.
+ FIX       cp .env.example .env and fill in S3_BUCKET.
 
  SYMPTOM   Row counts in S3 higher than local for the same date
  CAUSE     Regression in sync_partitions - it must DELETE the destination
@@ -473,4 +485,4 @@
                cannot be re-fetched once WMATA rotates them; and processed/
                becomes irreplaceable as soon as its source ages out of raw/ at
                90 days. Deleting one processed/ partition deliberately is fine
-               and is how you force a reprocess - see 5A.5.
+               and is how you force a reprocess - see 5A.4.

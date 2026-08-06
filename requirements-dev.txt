@@ -1,23 +1,56 @@
-# Repo-level development dependencies: tests and the local ETL.
+# Repo-level development dependencies: tests, the local ETL, and the notebooks.
 #
 # Distinct from infra/lambda_collector/requirements-dev.txt, which is scoped to
 # the collector and inherits that component's runtime pins. Nothing here is ever
 # bundled into the Lambda zip.
+#
+# This file is also what CI installs (.github/workflows/etl-daily.yml), so the
+# data-processing stack is pinned. That job runs unattended every night: an
+# unpinned major bump would break it one morning with no change on our side, and
+# the failure would look like a data problem rather than a dependency one.
 
 pytest
 
-# The ETL's stage B. Needs a JVM on the host — see the README; `src/etl/spark.py`
-# fails with install instructions rather than a stack trace if none is found.
-pyspark
+# --------------------------------------------------------------------------
+# The ETL's data stack — pinned
+# --------------------------------------------------------------------------
+# Stage B. Needs a JVM on the host; `src/etl/spark.py` fails with install
+# instructions rather than a stack trace if none is found.
+pyspark==4.2.0
 
-# Static GTFS bundles and realtime protobuf are read by the tests and the ETL.
-# Pinned to match the collector's runtime versions so a bundle that parses in
-# Lambda parses identically here.
+# Declared explicitly rather than leaned on as transitive dependencies. `pyspark`
+# treats both as optional, but src/etl imports them directly — `decode.py` builds
+# Arrow tables and `archive.py`/`schedule.py` use pandas frames — so a clean
+# install without these fails at import time.
+#
+# pandas 3.x makes PySpark emit a "does not yet fully support pandas >= 3.0"
+# warning. It is pinned here at the version everything was verified against; the
+# ETL avoids the Spark<->pandas bridge entirely (schedule frames go through
+# Parquet) precisely so that warning stays cosmetic.
+pandas==3.0.5
+pyarrow==25.0.0
+
+# --------------------------------------------------------------------------
+# Feed parsing — matched to the collector
+# --------------------------------------------------------------------------
+# Pinned to the collector's runtime versions so a snapshot that parses in Lambda
+# parses identically here.
 gtfs-realtime-bindings==2.2.0
 protobuf==7.35.1
 requests==2.34.2
 
 python-dotenv
 boto3
+
+# --------------------------------------------------------------------------
+# Tooling and notebooks
+# --------------------------------------------------------------------------
 black
 ruff
+
+# Needed by notebooks/, not by the ETL. Kept in one file rather than split so
+# there is a single declared dev environment; pip's cache makes the extra install
+# negligible in CI.
+jupyter
+matplotlib
+seaborn
