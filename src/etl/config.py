@@ -47,22 +47,31 @@ FEEDS_BY_MODE: Final[dict[str, tuple[str, str]]] = {
 # next to the feed names rather than being spelled inline.
 SNAPSHOT_SUFFIX: Final[str] = ".pb.gz"
 
-# The collector polls once a minute, so a healthy hour partition holds 60 files.
-# Anything materially short of this is collector downtime, which the ETL must
-# report rather than quietly treat as "no vehicles were running".
+# Fallback only. The real value is MEASURED per window by
+# `archive.modal_interval_seconds` and passed through the stage-A summary, because the
+# collector's cadence is a deployment setting that has already changed once (60s -> 30s)
+# and the archive therefore spans both eras. This constant is used only when a window
+# holds too few snapshots to measure a gap at all.
 EXPECTED_SNAPSHOTS_PER_HOUR: Final[int] = 60
 
-# Upper bound on how far a derived arrival time can be wrong, set by the polling
-# interval. Recorded in the output rather than hidden: a segment duration of a few
-# minutes carries a meaningful fraction of this as noise.
+# The collector's original cadence, kept as the nominal scale for
+# MAX_ARRIVAL_BRACKET_SEC below. Per-row quantization is NOT read from here — every
+# segment carries its own `arrival_bracket_sec`, measured from the two snapshots that
+# bracketed the arrival, which is correct whatever cadence produced it.
 SAMPLING_QUANTIZATION_SEC: Final[int] = 60
 
 # Widest gap between two consecutive observations of a vehicle that still yields a
-# usable arrival estimate. A stop_sequence increment brackets the arrival between
-# the two capture times, so the bracket width *is* the error bar. At three polling
-# intervals the estimate is too vague to be worth a row. Measured on real rail data:
-# 98.7% of transitions fall inside 180s, and the rest are vehicles that dropped out
-# of the feed and reappeared minutes later — a gap in observation, not a fast train.
+# usable arrival estimate. A stop_sequence increment brackets the arrival between the
+# two capture times, so the bracket width *is* the error bar. Measured on real rail
+# data at 60s: 98.7% of transitions fall inside 180s, and the rest are vehicles that
+# dropped out of the feed and reappeared minutes later — a gap in observation, not a
+# fast train.
+#
+# Deliberately an ABSOLUTE bound rather than a multiple of the current cadence. What a
+# consumer cares about is "how wrong can this arrival be", and 180s of uncertainty is
+# 180s regardless of how many polls it spans. Halving the interval therefore does not
+# move the bar; it just means more rows clear it, which is correct because they really
+# are more precise.
 MAX_ARRIVAL_BRACKET_SEC: Final[int] = 3 * SAMPLING_QUANTIZATION_SEC
 
 # WMATA sometimes sets `arrival.time` to 0 rather than omitting the field (473 of

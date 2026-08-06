@@ -23,6 +23,7 @@ import gzip
 import io
 import re
 import zipfile
+from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -174,6 +175,32 @@ def earliest_snapshot(s3: S3Client, config: EtlConfig, feed: str) -> datetime | 
     return datetime(
         values["year"], values["month"], values["day"], values["hour"], tzinfo=UTC
     )
+
+
+def modal_interval_seconds(keys: list[str]) -> int | None:
+    """The most common gap between consecutive snapshots, in seconds.
+
+    The collector's cadence is a deployment setting that changes over time — it moved
+    from 60s to 30s — and the archive therefore spans several. Anything that needs to
+    know the cadence must **measure** it from the data rather than read a constant,
+    or it silently describes the wrong era.
+
+    The mode rather than the mean, because a collector outage inserts one enormous gap
+    that would drag an average far off the real cadence. Returns None for fewer than
+    two snapshots, where there is no gap to measure.
+    """
+    if len(keys) < 2:
+        return None
+
+    stamps = sorted(captured_at_from_key(key) for key in keys)
+    gaps = Counter(
+        int((later - earlier).total_seconds())
+        for earlier, later in zip(stamps, stamps[1:], strict=False)
+    )
+    gaps.pop(0, None)  # duplicate keys would otherwise vote for a zero-second cadence
+    if not gaps:
+        return None
+    return gaps.most_common(1)[0][0]
 
 
 def captured_at_from_key(key: str) -> datetime:

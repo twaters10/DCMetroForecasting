@@ -182,13 +182,23 @@ def main(argv: list[str] | None = None) -> int:
     vp_feed = FEEDS_BY_MODE[args.mode][0]
     archive_start = earliest_snapshot(s3, config, vp_feed)
 
+    logger.info("mode=%s lookback=%dd", args.mode, args.lookback_days)
+    logger.info("archive begins %s", archive_start or "(empty)")
+
+    # An empty archive is not the same as an unbounded one. `pending_service_dates`
+    # reads `archive_start=None` as "no lower bound", which is right for tests but
+    # wrong here: with nothing in raw/ it would propose every date in the lookback
+    # window and start a Spark session for each, only to fail on missing input. This
+    # is reachable in practice — it is exactly the state right after wiping raw/.
+    if archive_start is None:
+        logger.info("raw archive is empty — nothing to process yet")
+        return 0
+
     done = set() if args.force else completed_service_dates(config, s3)
     pending = pending_service_dates(
         now, done, args.lookback_days, args.force, archive_start
     )
 
-    logger.info("mode=%s lookback=%dd", args.mode, args.lookback_days)
-    logger.info("archive begins %s", archive_start or "(empty)")
     logger.info("already in S3: %d date(s)", len(done))
     if not pending:
         logger.info("nothing outstanding — up to date")

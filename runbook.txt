@@ -83,7 +83,10 @@
    feed          rail_vehicle_positions | rail_trip_updates
                  bus_vehicle_positions  | bus_trip_updates
    format        gzipped GTFS-realtime protobuf, exactly as WMATA served it
-   cadence       one file per feed per minute -> 60 per hour partition
+   cadence       MEASURED per run, not assumed. Currently one file per feed per
+                 minute (60/hour). The DQ report prints the measured cadence and
+                 sizes its completeness check from it, so a future change needs no
+                 code edit. See docs/polling-cadence.md.
    partitioning  UTC
    retention     lifecycle rule expires objects under raw/ after 90 DAYS
    capture time  taken from the FILENAME, not S3 LastModified (which is write
@@ -323,7 +326,7 @@
  Reference: rail, --date 2026-08-05 (a COMPLETE service day)
  Wall time end to end, including decode: ~72 seconds.
 
-   snapshot coverage         complete 24/24, missing 0
+   snapshot coverage         measured cadence printed; complete 24/24, missing 0
    static match rate         100.00%
    segments built            34,045
    negative duration         0

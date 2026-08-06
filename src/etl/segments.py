@@ -31,7 +31,7 @@ from typing import Final
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
-from .config import SAMPLING_QUANTIZATION_SEC, SERVICE_TZ
+from .config import SERVICE_TZ
 
 # A segment whose actual duration exceeds this is almost certainly a derivation
 # artefact rather than a delayed train — a vehicle that vanished from the feed and
@@ -191,9 +191,15 @@ def build_segments(
         .withColumn(
             "duration_plausible",
             F.col("actual_duration_sec").isNotNull()
-            # A duration below the negative quantization bound cannot be real; a small
-            # negative is the two endpoints landing in the same polling interval.
-            & (F.col("actual_duration_sec") >= -SAMPLING_QUANTIZATION_SEC)
+            # A small negative duration is the two endpoints landing inside one
+            # polling interval; anything beyond that cannot be real.
+            #
+            # Bounded by the row's OWN bracket rather than a global constant. The
+            # collector's cadence changed from 60s to 30s, so the archive spans both
+            # and a fixed 60 would be twice as permissive as it should be on newer
+            # rows while being exactly right on older ones. `arrival_bracket_sec` is
+            # measured per row, so it is correct in every era by construction.
+            & (F.col("actual_duration_sec") >= -F.col("arrival_bracket_sec"))
             & (F.col("actual_duration_sec") <= IMPLAUSIBLE_DURATION_SEC)
             & (
                 F.col("scheduled_duration_sec").isNull()

@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import gzip
 import logging
+import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
 import requests
@@ -103,11 +104,57 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
         return collect_static_feeds(config, writer, captured_at, _SESSION)
 
-    results = [_collect_feed(spec, config, writer, captured_at) for spec in FEEDS]
+    return _collect_realtime(config, writer, captured_at)
 
+
+def _collect_realtime(
+    config: CollectorConfig, writer: SnapshotWriter, invoked_at: datetime
+) -> dict[str, Any]:
+    """Run `config.polls_per_invocation` collection passes over every feed.
+
+    With one pass this is exactly the original behaviour. With more, the passes are
+    spaced `config.poll_offset_seconds` apart to reach a cadence finer than
+    EventBridge Scheduler's one-minute floor.
+
+    Each pass gets its **own** `captured_at`. Reusing the invocation's timestamp
+    would give every pass the same object key, so the second write would silently
+    overwrite the first and the extra polling would buy nothing.
+    """
+    passes: list[list[FeedResult]] = []
+    previous_captured_at: datetime | None = None
+
+    for index in range(config.polls_per_invocation):
+        # Sleep to an absolute target rather than for a fixed duration. `sleep(30)`
+        # after a pass that took 8s puts the next one 38s later, and the error
+        # compounds across passes — snapshots would drift within the minute instead
+        # of landing near :00 and :30.
+        target = invoked_at + timedelta(seconds=index * config.poll_offset_seconds)
+        remaining = (target - datetime.now(UTC)).total_seconds()
+        if remaining > 0:
+            time.sleep(remaining)
+        elif index:
+            # Already behind — a slow pass ate the gap. Go immediately; a slightly
+            # uneven cadence beats a skipped snapshot.
+            logger.warning(
+                "pass=%d behind schedule by %.1fs, collecting immediately",
+                index,
+                -remaining,
+            )
+
+        captured_at = _distinct_second(previous_captured_at)
+        previous_captured_at = captured_at
+        passes.append(
+            [_collect_feed(spec, config, writer, captured_at) for spec in FEEDS]
+        )
+
+    results = [result for single_pass in passes for result in single_pass]
     succeeded = sum(1 for r in results if r.ok)
     return {
-        "captured_at": captured_at.isoformat(),
+        # The first pass's time, so the field means what it always did.
+        "captured_at": invoked_at.isoformat(),
+        "polls": len(passes),
+        # Totals across every pass. deploy.sh's smoke test reads `feeds_failed`, so
+        # it has to stay a count of failures rather than become a per-pass structure.
         "feeds_ok": succeeded,
         "feeds_failed": len(results) - succeeded,
         "results": [
@@ -262,6 +309,28 @@ def _get_writer(config: CollectorConfig) -> SnapshotWriter:
             assert config.s3_bucket is not None
             _WRITER = S3Writer(config.s3_bucket)
     return _WRITER
+
+
+def _distinct_second(previous: datetime | None) -> datetime:
+    """Now, guaranteed to fall in a later whole second than `previous`.
+
+    Object keys are stamped with `int(captured_at.timestamp())`, so two passes landing
+    in the same second would build the *same* key and the second write would silently
+    overwrite the first — the extra polling would cost money and archive nothing.
+
+    Normally impossible: passes are 30s apart. It becomes reachable when an invocation
+    is already behind its targets (a replay, or a pass slower than the offset), because
+    then passes run back to back and a pass where every feed fails fast takes only
+    milliseconds. Cheap to make impossible rather than improbable.
+    """
+    moment = datetime.now(UTC)
+    if previous is None:
+        return moment
+
+    while int(moment.timestamp()) <= int(previous.timestamp()):
+        time.sleep(0.05)
+        moment = datetime.now(UTC)
+    return moment
 
 
 def _describe(exc: BaseException) -> str:

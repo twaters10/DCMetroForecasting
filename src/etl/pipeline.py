@@ -30,7 +30,11 @@ import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .archive import resolve_static_bundle, snapshot_keys_by_hour
+from .archive import (
+    modal_interval_seconds,
+    resolve_static_bundle,
+    snapshot_keys_by_hour,
+)
 from .config import FEEDS_BY_MODE, SERVICE_TZ, EtlConfig
 from .decode import decode_feed
 from .quality import QualityReport, check_segments, check_snapshot_coverage
@@ -156,10 +160,12 @@ def main(argv: list[str] | None = None) -> int:
         # lose its only downtime check. Listing is cheap; decoding is not.
         for feed in (vp_feed, tu_feed):
             keys_by_hour = snapshot_keys_by_hour(s3, config, feed, start, end)
+            all_keys = [key for keys in keys_by_hour.values() for key in keys]
             decode_summaries.append(
                 {
                     "feed": feed,
                     "snapshots_by_hour": {k: len(v) for k, v in keys_by_hour.items()},
+                    "interval_seconds": modal_interval_seconds(all_keys),
                 }
             )
     else:
