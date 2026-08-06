@@ -423,6 +423,13 @@
  CHECK     GitHub -> Actions -> etl-daily. A disabled schedule says so at the top.
  FIX       Re-enable it, then run once manually to catch up.
 
+ SYMPTOM   IAM rejects a policy while CREATING the role ("Unsupported Principal"
+           / "Missing Resource")
+ CAUSE     The trust policy was pasted into the permissions editor. They are two
+           different documents: trust has Principal and no Resource, permissions
+           has Resource and no Principal.
+ FIX       docs/ci-setup.md, "Troubleshooting the setup".
+
  SYMPTOM   CI fails at "Configure AWS credentials"
  CAUSE 1   Repo variable AWS_ROLE_ARN unset or wrong.
  CAUSE 2   The role's trust policy does not match this repo. The `sub` condition
