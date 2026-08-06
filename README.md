@@ -16,7 +16,7 @@ every actual-vs-scheduled delta has to be captured as it goes by. See
 | Stage | Component | State |
 | --- | --- | --- |
 | 1 | Collection — `infra/lambda_collector/` (realtime + static GTFS) | in progress |
-| 2 | Processing — local PySpark ETL | not started |
+| 2 | Processing — local PySpark ETL (`src/etl/`) | rail pipeline running; DQ report, tests and docs outstanding |
 | 3 | Training — LightGBM/XGBoost, local | not started |
 | 4 | Registry & serving — SageMaker Serverless Inference | not started |
 | 5 | Monitoring — `evidently` drift reports | not started |
@@ -45,3 +45,61 @@ export AWS_PROFILE=metro-pulse
 
 Full collector documentation lands in `infra/lambda_collector/` as that stage
 completes.
+
+## Quick start (ETL)
+
+PySpark needs a JVM. The ETL locates a Homebrew JDK automatically and otherwise
+fails with install instructions rather than a stack trace:
+
+```bash
+brew install openjdk@17
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17   # only if auto-detection misses
+```
+
+Explore what a window of the archive actually contains — run this before trusting
+any derived field:
+
+```bash
+python -m src.etl.explore --mode rail --start 2026-08-05T11 --end 2026-08-05T14
+```
+
+Build the trip-segment table. Takes a UTC hour range or one local service day, and
+re-running a range replaces only those `service_date` partitions:
+
+```bash
+python -m src.etl.pipeline --mode rail --date 2026-08-05
+python -m src.etl.pipeline --mode rail --start 2026-08-05T11 --end 2026-08-05T14
+python -m src.etl.pipeline --mode rail --date 2026-08-05 --skip-decode  # iterate fast
+```
+
+`--skip-decode` reuses the staged observations instead of re-reading S3, which is the
+loop to use while changing derivation logic. See [`docs/static-gtfs.md`](docs/static-gtfs.md)
+for why the schedule join keys on `scheduled_trip_id`.
+
+### Unattended
+
+A launchd job runs `src.etl.catchup` daily. It processes every *complete* service day
+missing from S3 rather than "yesterday", so a missed run — a closed laptop, a holiday —
+costs nothing and the next run catches up. Install steps are in
+[`runbook.txt`](runbook.txt) §5A.
+
+```bash
+python -m src.etl.catchup --dry-run    # what is outstanding
+python -m src.etl.catchup              # process it, then sync to S3
+```
+
+### Reading the segment table
+
+S3 is the authoritative copy — `raw/` expires after 90 days, after which the segments
+are the only surviving record of those service days.
+
+```python
+from src.etl.config import EtlConfig
+from src.etl.processed import read_segments
+
+table = read_segments(EtlConfig.from_env())          # every service date
+table = read_segments(config, ["2026-08-05"])        # one date
+```
+
+See [`docs/etl.md`](docs/etl.md) for how arrivals are derived and what the data cannot
+tell you.
