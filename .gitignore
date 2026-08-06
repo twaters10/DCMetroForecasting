@@ -19,5 +19,18 @@ package/
 # Local collector output (see LOCAL_OUTPUT_DIR)
 data/local/
 
+# ETL working data. All of it is reproducible from the S3 archive by re-running the
+# pipeline, and the Parquet is far too large to track.
+data/staging/
+data/staging-*/
+data/processed/
+data/cache/
+
 # OS
 .DS_Store
+
+# Scheduled-run logs
+logs/
+
+# Notebooks
+notebooks/

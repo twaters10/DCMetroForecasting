@@ -1,0 +1,476 @@
+================================================================================
+ METRO-PULSE-FORECAST — STAGE 2 (ETL) RUNBOOK
+ Raw GTFS-realtime snapshots  ->  trip-segment table
+================================================================================
+
+ Audience: whoever runs or debugs this pipeline, including its author in six
+ months. For *why* the derivation works the way it does, see docs/etl.md. This
+ file is about operating it.
+
+ Last verified: 2026-08-06 against s3://metro-pulse-forecast-tawate
+
+
+================================================================================
+ 1. WHAT THIS STAGE DOES
+================================================================================
+
+ The collector (stage 1) archives the *current state* of the WMATA feeds every
+ 60 seconds. That is not a list of events: the same train appears in hundreds of
+ consecutive snapshots and nothing in the data says "arrived at stop X at time
+ T". Stage 2 derives those arrivals, pairs them into segment traversals, joins
+ the scheduled timetable, and writes one row per observed segment traversal.
+
+ The output is the training set for stages 3-4 (features and models).
+
+ Two stages, run by one command:
+
+   STAGE A  decode    S3 protobuf snapshots -> observation Parquet
+                      Threaded Python. Not Spark - see docs/etl.md for why.
+
+   STAGE B  derive    observation Parquet -> arrivals -> segments -> Parquet
+                      PySpark, local.
+
+ Stage A is the slow one (network). Stage B is seconds. `--skip-decode` reuses
+ stage A output and is the loop to use while changing derivation logic.
+
+
+================================================================================
+ 2. PREREQUISITES
+================================================================================
+
+ AWS credentials      Profile `metro-pulse`. The `default` profile in this
+                      account is STALE and fails with InvalidClientTokenId.
+
+                        export AWS_PROFILE=metro-pulse
+                        aws sts get-caller-identity     # expect user/taylor-admin
+
+ Java                 PySpark needs a JVM. Auto-detected from Homebrew paths;
+                      set JAVA_HOME explicitly if it is installed elsewhere.
+
+                        brew install openjdk@17
+                        export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+
+                      If missing, src/etl/spark.py raises JavaNotFoundError with
+                      install instructions rather than a stack trace.
+
+ Python               3.12 in .venv
+
+                        pip install -r requirements-dev.txt
+
+ Environment          Repo-root .env, loaded by EtlConfig.from_env(). Only
+                      S3_BUCKET is required; the rest default.
+
+                        S3_BUCKET=<bucket>              (required)
+                        S3_PREFIX=raw/                  (default raw/)
+                        S3_STATIC_PREFIX=static/        (default static/)
+                        S3_PROCESSED_PREFIX=processed/   (default processed/)
+                        ETL_CACHE_DIR=data/cache        (default data/cache)
+
+ Static GTFS          At least one archived bundle must cover the service date
+                      being processed, under s3://<bucket>/static/<mode>/.
+                      If none exists the run fails with instructions. The
+                      collector's daily task maintains this.
+
+
+================================================================================
+ 3. INPUTS
+================================================================================
+
+ 3.1  Realtime snapshots  (read from S3, never written)
+
+   s3://<bucket>/raw/{feed}/year=YYYY/month=MM/day=DD/hour=HH/{feed}-{unix}.pb.gz
+
+   feed          rail_vehicle_positions | rail_trip_updates
+                 bus_vehicle_positions  | bus_trip_updates
+   format        gzipped GTFS-realtime protobuf, exactly as WMATA served it
+   cadence       one file per feed per minute -> 60 per hour partition
+   partitioning  UTC
+   retention     lifecycle rule expires objects under raw/ after 90 DAYS
+   capture time  taken from the FILENAME, not S3 LastModified (which is write
+                 time and differs by seconds)
+
+   Only the requested hour partitions are listed. The bucket is never scanned.
+
+ 3.2  Static GTFS bundle  (read from S3, cached locally)
+
+   s3://<bucket>/static/{mode}/feed_start=YYYYMMDD/feed_end=YYYYMMDD/
+       {mode}-gtfs-static-{sha256[:12]}.zip
+
+   Resolved by feed window against the service date. Preference order:
+     1. a bundle whose window CONTAINS the service date
+     2. else the newest bundle at or before it
+     3. else the newest bundle at all
+   Cases 2 and 3 mean scheduled times may not be the ones in force - the run
+   reports it and every row carries schedule_version_agrees.
+
+   Cached under ETL_CACHE_DIR. Content-addressed keys make the cache safe: a
+   matching filename cannot be stale content.
+
+   Read from S3, NOT live from WMATA. WMATA serves only the current bundle
+   (rail's window is ~10 days), so a live fetch would silently join historical
+   realtime data against a newer timetable.
+
+
+================================================================================
+ 4. OUTPUTS
+================================================================================
+
+ 4.1  Stage A - observation Parquet (intermediate, reproducible, gitignored)
+
+   {--staging}/{feed}/service_date=YYYY-MM-DD/part-*.parquet     default data/staging
+
+   One row per vehicle per snapshot (VP), or per stop_time_update (TU).
+   Idempotent per partition: re-decoding a date replaces that date only.
+   Safe to delete; regenerated by re-running without --skip-decode.
+
+   Rows dropped at this stage, deliberately:
+     - vehicles with no trip_id      (deadheading; cannot join a schedule)
+     - stop_time_updates SKIPPED     (stops that will not be served)
+     - timestamps of 0               (WMATA sentinel, not a 1970 instant)
+
+ 4.2  Stage B - the trip-segment table (the deliverable)
+
+   local (working copy):
+     {--output}/service_date=YYYY-MM-DD/part-*.parquet default data/processed/segments
+
+   S3 (AUTHORITATIVE - what downstream stages read):
+     s3://<bucket>/processed/segments/service_date=YYYY-MM-DD/*.parquet
+
+   The catch-up driver uploads each date after a successful run, replacing that
+   prefix wholesale. S3 is the copy that matters: raw/ expires after 90 days,
+   after which these segments are the ONLY surviving record of those service
+   days, and a table living on one laptop is one disk failure from gone.
+   One file per service day, ~600 KB.
+
+   Read it from Python:
+
+     from src.etl.config import EtlConfig
+     from src.etl.processed import read_segments
+     table = read_segments(EtlConfig.from_env())            # all dates
+     table = read_segments(cfg, ["2026-08-05"])             # one date
+
+   Via pyarrow, not Spark: this PySpark install has no hadoop-aws jar, so
+   s3a:// is unavailable, and the dataset is small enough that starting a
+   Spark session to read it would be pure overhead.
+
+   ONE ROW PER OBSERVED TRAVERSAL OF A SEGMENT (stop A -> stop B on one trip).
+
+   identity      trip_id, trip_run, scheduled_trip_id, route_id, direction_id,
+                 mode
+   segment       from_stop_id, to_stop_id, from_stop_sequence, stop_sequence,
+                 stop_span
+   scheduled     scheduled_departure_ts, scheduled_arrival_ts,
+                 scheduled_duration_sec
+   actual        actual_departure_ts, actual_arrival_ts, actual_duration_sec
+   target        delay_sec           (actual minus scheduled)
+   provenance    arrival_source, arrival_bracket_sec, arrival_confident,
+                 duration_plausible, schedule_version_agrees,
+                 static_gtfs_version
+   time          service_date (partition key), observed_at_utc
+
+   Timestamps are UTC. service_date is AMERICA/NEW_YORK, taken from the feed's
+   own trip.start_date, so an after-midnight trip stays on the previous service
+   day.
+
+   Partitioned by service_date. Written with dynamic partition overwrite: a
+   re-run replaces only the dates it produced and leaves the rest intact.
+
+ 4.3  Columns you must read before trusting a row
+
+   arrival_source           vehicle_position = observed; trip_update =
+                            predicted (~5% of rows)
+   arrival_confident        false = wide bracket, estimate is vague (~5%)
+   duration_plausible       false = failed a sanity check; kept, not dropped
+   schedule_version_agrees  false = scheduled times may not have been in force
+   trip_run > 0             a repeat run of a reused trip_id (~18% of rows);
+                            shares the first run's timetable
+   stop_span > 1            a stop was passed between polls (~1.6%)
+
+ 4.4  Data-quality report (stdout, every run)
+
+   Printed last. Covers snapshot coverage per hour, the static match rate, and
+   row-level counts. Ends with either "no blocking issues" or a list.
+
+
+================================================================================
+ 5. HOW TO RUN
+================================================================================
+
+   export AWS_PROFILE=metro-pulse
+   export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+
+ 5.1  Look before you process. Reads a window and reports what is actually in
+      the feeds. Writes nothing.
+
+   python -m src.etl.explore --mode rail --start 2026-08-05T11 --end 2026-08-05T14
+
+ 5.2  One America/New_York service day (the normal case)
+
+   python -m src.etl.pipeline --mode rail --date 2026-08-05
+
+      Resolves to a 24-hour LOCAL day, i.e. 04:00 UTC to 04:00 UTC next day
+      (and 25 hours on the fall-back date). Not a UTC day.
+
+ 5.3  An explicit UTC hour range. --end is EXCLUSIVE.
+
+   python -m src.etl.pipeline --mode rail --start 2026-08-05T11 --end 2026-08-05T14
+
+ 5.4  Fast iteration on derivation logic - reuses staged observations, no S3
+
+   python -m src.etl.pipeline --mode rail --date 2026-08-05 --skip-decode
+
+ 5.5  Automated / CI - exit non-zero on a blocking quality issue
+
+   python -m src.etl.pipeline --mode rail --date 2026-08-05 --fail-on-quality
+
+ 5.6  Backfill. Prefer the catch-up driver over a hand-rolled loop - it already
+      knows which dates are outstanding, syncs each one, and will not propose a
+      date the archive cannot fully cover.
+
+   python -m src.etl.catchup --lookback-days 30
+
+      A per-day loop over the pipeline directly is also safe (each date is an
+      independent partition, and both stages are scoped to their own window),
+      but it skips the S3 sync, so the output stays local:
+
+   for d in 2026-08-05 2026-08-06; do
+     python -m src.etl.pipeline --mode rail --date "$d" || echo "FAILED $d"
+   done
+
+ 5.7  Tests. No network, no S3, no .env. ~22s including Spark startup.
+
+   python -m pytest tests/ -q
+
+ pipeline flags:
+   --mode {rail,bus}    default rail. Bus is UNTESTED - see docs/etl.md.
+   --date               one local service day (mutually exclusive with --start)
+   --start / --end      UTC hours, --end exclusive
+   --staging            stage A output dir      default data/staging
+   --output             stage B output dir      default data/processed/segments
+   --skip-decode        reuse staged observations
+   --max-workers        S3 fetch concurrency    default 16
+   --fail-on-quality    exit 1 on a blocking issue
+
+ catchup flags:
+   --dry-run            list outstanding dates, change nothing
+   --force              reprocess dates already in S3 (after a logic change)
+   --lookback-days      how far back to look for gaps   default 14
+   --prune-staging-days delete staging older than this  default 7
+   --no-sync            process locally, do not upload to S3
+
+
+================================================================================
+ 5A. AUTOMATED OPERATION (the daily schedule)
+================================================================================
+
+ The scheduled job is `src.etl.catchup`, not the pipeline directly, and it is
+ deliberately NOT "process yesterday". It asks which complete service days are
+ missing from S3 and processes those. Consequences worth internalising:
+
+   - Missing a run is not an incident. The next run catches up.
+   - The real deadline is the 90-day raw/ retention, not any cron firing.
+   - A day is only processed once it has CLOSED (04:00 UTC the next day), so
+     today is never written half-finished.
+   - Dates the archive cannot fully cover are never proposed, including the
+     collector's first partial day.
+
+ Trigger: launchd, not cron. cron silently skips a job whose time passed while
+ the Mac was asleep; launchd runs a missed StartCalendarInterval job at next
+ wake. Scheduled for 09:00 local, when the machine is usually awake.
+
+ 5A.1  Install the schedule
+
+   REPO="$(pwd)"
+   mkdir -p ~/Library/LaunchAgents
+   sed "s|__REPO_ROOT__|$REPO|g" infra/launchd/com.metropulse.etl.plist \
+     > ~/Library/LaunchAgents/com.metropulse.etl.plist
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.metropulse.etl.plist
+
+ 5A.2  Verify
+
+   launchctl print gui/$(id -u)/com.metropulse.etl | head -20
+   launchctl kickstart -k gui/$(id -u)/com.metropulse.etl    # force a run now
+   tail -f logs/etl-$(date +%Y-%m).log
+
+ 5A.3  Uninstall
+
+   launchctl bootout gui/$(id -u)/com.metropulse.etl
+   rm ~/Library/LaunchAgents/com.metropulse.etl.plist
+
+ 5A.4  Logs
+
+   logs/etl-YYYY-MM.log     the run log, appended, one section per run
+   logs/launchd.{out,err}.log
+                            only catches failures BEFORE the wrapper starts
+                            (bad path, missing interpreter). Normally empty.
+
+ 5A.5  Reprocess a date after changing derivation logic
+
+   python -m src.etl.catchup --force --lookback-days 30
+
+      or, for one date, delete its partition from S3 and let the next run pick
+      it up:
+
+   aws s3 rm s3://<bucket>/processed/segments/service_date=2026-08-05/ --recursive
+
+
+================================================================================
+ 6. WHAT A HEALTHY RUN LOOKS LIKE
+================================================================================
+
+ Reference: rail, --date 2026-08-05 (a COMPLETE service day)
+ Wall time end to end, including decode: ~72 seconds.
+
+   snapshot coverage         complete 24/24, missing 0
+   static match rate         100.00%
+   segments built            34,045
+   negative duration         0
+   implausibly long          2     (0.0%)
+   actual >> scheduled       5     (0.0%)
+   stop_sequence gaps        514   (1.5%)
+   wide arrival bracket      1,482 (4.4%)
+   from predictions          1,156 (3.4%)
+   repeat run of a trip_id   7,330 (21.5%)
+   delay_sec                 p05 -60, median 0, p95 +60
+   blocking issues           none
+
+ delay_sec of p05 -60 / median 0 / p95 +60 is EXPECTED, not suspicious. Those
+ are 60-second quantization bins from the polling interval, not a claim that
+ trains are exactly on time. See docs/etl.md.
+
+ A 100% "stale schedule version" count is currently normal: realtime was still
+ emitting 20660 while the archived bundle is 20670.
+
+
+================================================================================
+ 7. TROUBLESHOOTING
+================================================================================
+
+ SYMPTOM   InvalidClientTokenId
+ CAUSE     Using the default AWS profile.
+ FIX       export AWS_PROFILE=metro-pulse
+
+ SYMPTOM   JavaNotFoundError
+ CAUSE     No JVM.
+ FIX       brew install openjdk@17
+           export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+
+ SYMPTOM   EOFException reading the port number from pyspark.daemon's stdout
+ CAUSE     Spark launched a Python worker with system python3.8, which lacks
+           importlib.resources.files and dies inside PySpark's own imports.
+ FIX       Already handled - spark.pin_worker_interpreter() pins
+           PYSPARK_PYTHON to sys.executable. If it recurs, confirm the pipeline
+           is being run with .venv/bin/python and not a system interpreter.
+
+ SYMPTOM   MATCH RATE ... IS LOW  (below 95%)
+ CAUSE     Almost always: no archived static bundle covers this service date.
+ CHECK     aws s3 ls s3://<bucket>/static/rail/ --recursive
+ FIX       Run the collector's static task, then re-run. If the date is older
+           than every archived bundle, that timetable is gone for good - the
+           rows can still be produced but delay_sec will be approximate.
+ NOT       Do NOT "fix" this by joining on trip_id directly. That matches 0%.
+
+ SYMPTOM   FileNotFoundError: no static GTFS bundles archived
+ FIX       AWS_PROFILE=metro-pulse aws lambda invoke \
+             --function-name metro-pulse-collector \
+             --payload '{"task":"static_gtfs"}' \
+             --cli-binary-format raw-in-base64-out /dev/stdout
+
+ SYMPTOM   "EMPTY ... collector down" in the coverage report
+ CAUSE     Genuine collector downtime for that hour. Hours that have not yet
+           elapsed are reported as "not yet elapsed" and are not an issue.
+ FIX       Not fixable retroactively - the snapshots do not exist. Arrivals
+           spanning the gap get a wide bracket and arrival_confident = false.
+
+ SYMPTOM   no snapshots under s3://.../{feed}/ for <window>
+ CAUSE     Window predates the collector, or is beyond the 90-day retention,
+           or is in the future.
+ CHECK     aws s3 ls s3://<bucket>/raw/rail_vehicle_positions/ --recursive | tail
+
+ SYMPTOM   Negative actual_duration_sec, or stop_span of 0
+ CAUSE     Regression in trip_run sessionisation. A reused trip_id is being
+           treated as one journey and two runs are being paired together.
+ CHECK     python -m pytest tests/test_etl.py -k reused_trip_id
+ EXPECT    Zero negative durations in a healthy run.
+
+ SYMPTOM   Segment count roughly doubles when processing a multi-day range
+ CAUSE     Regression in the schedule join - service_date must be a JOIN KEY,
+           not just carried through, or an N-date schedule matches each segment
+           N times.
+ CHECK     Compare per-date counts against the same dates run individually.
+
+ SYMPTOM   Spark is slow / hundreds of tiny tasks
+ CAUSE     spark.sql.shuffle.partitions left at Spark's default of 200.
+ FIX       Already set to 8 in spark.build_session for this data size.
+
+ SYMPTOM   catchup says "nothing outstanding" but a day is clearly missing
+ CAUSE     Either the day has not closed yet (it closes at 04:00 UTC the NEXT
+           day), or it falls outside --lookback-days, or the archive does not
+           cover the whole of it (see "archive begins" in the log).
+ CHECK     python -m src.etl.catchup --dry-run
+ FIX       Widen --lookback-days. A date the archive cannot fully cover is
+           excluded on purpose and cannot be fixed - the snapshots do not exist.
+
+ SYMPTOM   catchup proposes dates from before the collector existed
+ CAUSE     Regression in the archive_start bound; each would start a Spark
+           session only to fail on missing input.
+ CHECK     python -m pytest tests/test_etl.py -k before_the_archive
+
+ SYMPTOM   launchd job never runs
+ CHECK     launchctl print gui/$(id -u)/com.metropulse.etl
+ CAUSE 1   Not loaded. Re-run the bootstrap in 5A.1.
+ CAUSE 2   Mac asleep at 09:00. launchd runs it at next wake - confirm by the
+           timestamp in logs/etl-YYYY-MM.log rather than assuming it was
+           skipped. Nothing is lost either way; the next run catches up.
+ CAUSE 3   The wrapper died before logging. Check logs/launchd.err.log, which
+           is otherwise empty.
+
+ SYMPTOM   launchd job runs but fails with credential or Java errors
+ CAUSE     launchd starts jobs with almost no environment - no AWS_PROFILE, no
+           JAVA_HOME, no useful PATH, cwd of /.
+ FIX       scripts/run_etl_daily.sh sets all of these. Run it directly to
+           reproduce: ./scripts/run_etl_daily.sh --dry-run
+
+ SYMPTOM   Row counts in S3 higher than local for the same date
+ CAUSE     Regression in sync_partitions - it must DELETE the destination
+           prefix before uploading, or leftover part files from a run that
+           produced more fragments are still read as part of the dataset.
+ CHECK     aws s3 ls s3://<bucket>/processed/segments/service_date=<d>/
+ EXPECT    Exactly one .parquet file per service day, no .crc sidecars.
+
+
+================================================================================
+ 8. OPERATIONAL NOTES
+================================================================================
+
+ IDEMPOTENCY   Both stages replace only the service_date partitions they
+               produce. Re-running any day any number of times is safe and
+               does not duplicate rows. Verified: 5,792 rows before and after
+               a re-run.
+
+ RETENTION     raw/ expires after 90 days. Anything not processed within 90
+               days of capture is lost. static/ has no expiry and must not be
+               placed under raw/ - config.py refuses to start if the prefixes
+               nest.
+
+ COST          Stage A is the only S3 read cost: GETs proportional to the
+               window (~2,880 objects per rail service day across both feeds).
+               --skip-decode costs nothing. Nothing here writes to S3 today;
+               output is local.
+
+ SCALE         A complete rail service day is ~34,000 segment rows from
+               ~2,880 snapshots, ~600 KB, ~72 seconds end to end. Rail alone is
+               comfortably pandas-sized; PySpark is here for bus (~10x volume)
+               and for the multi-month case.
+
+ SAFE TO       data/staging*, data/processed*, data/cache, logs/ - all
+ DELETE        gitignored, and all reproducible by re-running while raw/ still
+               holds the source. The catch-up driver prunes staging older than
+               7 days on its own.
+
+ DO NOT        Anything under s3://<bucket>/raw/, /static/ or /processed/.
+ DELETE        raw/ cannot be rebuilt (it is a live capture); static/ bundles
+               cannot be re-fetched once WMATA rotates them; and processed/
+               becomes irreplaceable as soon as its source ages out of raw/ at
+               90 days. Deleting one processed/ partition deliberately is fine
+               and is how you force a reprocess - see 5A.5.

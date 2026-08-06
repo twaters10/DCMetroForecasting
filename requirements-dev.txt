@@ -6,6 +6,10 @@
 
 pytest
 
+# The ETL's stage B. Needs a JVM on the host — see the README; `src/etl/spark.py`
+# fails with install instructions rather than a stack trace if none is found.
+pyspark
+
 # Static GTFS bundles and realtime protobuf are read by the tests and the ETL.
 # Pinned to match the collector's runtime versions so a bundle that parses in
 # Lambda parses identically here.

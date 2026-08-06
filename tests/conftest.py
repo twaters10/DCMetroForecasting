@@ -12,7 +12,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-COLLECTOR_DIR = Path(__file__).resolve().parents[1] / "infra" / "lambda_collector"
+ROOT = Path(__file__).resolve().parents[1]
+COLLECTOR_DIR = ROOT / "infra" / "lambda_collector"
 
-if str(COLLECTOR_DIR) not in sys.path:
-    sys.path.insert(0, str(COLLECTOR_DIR))
+# The ETL is a real package and is imported as `src.etl.*`, so only the repo root is
+# needed for it. Deliberately NOT putting `src/etl` on the path: it uses relative
+# imports, and a flat `config` there would shadow the collector's `config` — two
+# different modules with the same name, resolved by path order.
+for directory in (COLLECTOR_DIR, ROOT, Path(__file__).resolve().parent):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
