@@ -337,3 +337,71 @@ def test_static_prefix_nested_under_raw_is_refused(static_prefix):
     """raw/ expires after 90 days and WMATA cannot re-serve an old bundle."""
     with pytest.raises(ConfigError, match="must not nest"):
         CollectorConfig.from_env({**BASE_ENV, "S3_STATIC_PREFIX": static_prefix})
+
+
+# --------------------------------------------------------------------------
+# Multi-pass realtime collection (sub-minute cadence)
+# --------------------------------------------------------------------------
+
+
+def test_polls_per_invocation_defaults_to_one_pass():
+    """The 60s behaviour must be unchanged unless explicitly opted out of."""
+    import handler
+
+    config = CollectorConfig.from_env(BASE_ENV)
+    writer = RecordingWriter()
+
+    summary = handler._collect_realtime(
+        config, writer, datetime(2026, 8, 5, 12, tzinfo=UTC)
+    )
+
+    assert summary["polls"] == 1
+    assert summary["feeds_ok"] + summary["feeds_failed"] == 4  # four feeds, one pass
+
+
+def test_two_passes_produce_distinct_object_keys(monkeypatch):
+    """The whole point: a second pass must archive a second snapshot, not overwrite.
+
+    Passes are stamped with `int(captured_at.timestamp())`, so two passes landing in the
+    same second would build identical keys and the second write would silently replace
+    the first — paying for the extra poll and archiving nothing.
+
+    `invoked_at` is set in the past so both targets have already elapsed and the test
+    does not wait 30 seconds. That also exercises the behind-schedule branch, which is
+    exactly the case where two passes could collide within one second.
+    """
+    import handler
+
+    captured: list[str] = []
+
+    def fake_collect(spec, config, writer, captured_at):
+        captured.append(handler.build_key(config.s3_prefix, spec.name, captured_at))
+        return handler.FeedResult(spec.name, "ok")
+
+    monkeypatch.setattr(handler, "_collect_feed", fake_collect)
+
+    config = CollectorConfig.from_env({**BASE_ENV, "POLLS_PER_INVOCATION": "2"})
+    summary = handler._collect_realtime(
+        config, RecordingWriter(), datetime(2026, 8, 5, 12, tzinfo=UTC)
+    )
+
+    assert summary["polls"] == 2
+    assert summary["feeds_failed"] == 0
+    assert len(captured) == 8, "four feeds x two passes"
+    assert len(set(captured)) == 8, "every key must be unique"
+
+
+def test_passes_are_spaced_by_the_configured_offset():
+    """Two passes on a 60s schedule means one every 30s."""
+    config = CollectorConfig.from_env({**BASE_ENV, "POLLS_PER_INVOCATION": "2"})
+    assert config.poll_offset_seconds == 30.0
+
+    config = CollectorConfig.from_env({**BASE_ENV, "POLLS_PER_INVOCATION": "4"})
+    assert config.poll_offset_seconds == 15.0
+
+
+@pytest.mark.parametrize("value", ["0", "61", "abc", "2.5", "-1"])
+def test_a_bad_poll_count_is_refused_at_startup(value):
+    """A typo parsing as 60 would make one invocation run for an hour and be billed."""
+    with pytest.raises(ConfigError, match="POLLS_PER_INVOCATION"):
+        CollectorConfig.from_env({**BASE_ENV, "POLLS_PER_INVOCATION": value})

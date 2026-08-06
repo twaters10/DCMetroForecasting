@@ -22,9 +22,16 @@ from typing import Final
 WMATA_API_KEY_HEADER: Final[str] = "api_key"
 WMATA_GTFS_BASE_URL: Final[str] = "https://api.wmata.com/gtfs"
 
-# (connect, read) seconds. This function is invoked every 60s, so a slow feed
-# must never let one invocation overlap the next. Worst case with the feeds
-# below is 4 x (3.05 + 7) ~= 40s, comfortably inside the 60s Lambda timeout.
+# How often EventBridge invokes this function. Not read by the code — EventBridge
+# owns the schedule — but the poll arithmetic below is expressed against it, and
+# leaving it implicit is how the two drift apart.
+SCHEDULE_INTERVAL_SECONDS: Final[int] = 60
+
+# (connect, read) seconds. Worst case with the four feeds below is
+# 4 x (3.05 + 7) ~= 40s per pass. That fits one pass inside a 60s cadence with
+# room to spare; with POLLS_PER_INVOCATION > 1 the budget is per pass and the
+# function's own timeout has to cover the whole invocation (see
+# CollectorConfig.polls_per_invocation).
 HTTP_TIMEOUT_SECONDS: Final[tuple[float, float]] = (3.05, 7.0)
 
 # A single fetch attempt per feed per invocation. No retries by design: the next
@@ -165,12 +172,22 @@ class CollectorConfig:
     wmata_api_key: str
     s3_prefix: str
     s3_static_prefix: str
+    polls_per_invocation: int = 1
     s3_bucket: str | None = None
     local_output_dir: str | None = None
 
     @property
     def writes_locally(self) -> bool:
         return self.local_output_dir is not None
+
+    @property
+    def poll_offset_seconds(self) -> float:
+        """Seconds between passes within one invocation.
+
+        `SCHEDULE_INTERVAL_SECONDS / polls_per_invocation` — two passes on a 60s
+        schedule means one every 30s.
+        """
+        return SCHEDULE_INTERVAL_SECONDS / self.polls_per_invocation
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> CollectorConfig:
@@ -226,9 +243,46 @@ class CollectorConfig:
             wmata_api_key=api_key,
             s3_prefix=raw,
             s3_static_prefix=static,
+            polls_per_invocation=_polls_per_invocation(
+                _clean(source.get("POLLS_PER_INVOCATION"))
+            ),
             s3_bucket=bucket,
             local_output_dir=local_dir,
         )
+
+
+def _polls_per_invocation(value: str | None) -> int:
+    """How many collection passes one invocation performs. Defaults to 1.
+
+    Raising this is how a sub-minute cadence is reached without a sub-minute
+    schedule: EventBridge Scheduler's floor is one minute, so two passes 30s apart
+    inside a single invocation is the only way to get a 30s archive from a single
+    schedule.
+
+    **It is not the cheapest way.** Waiting between passes is billed Lambda
+    duration, so two passes on a 60s schedule costs roughly $11/month at 1024 MB to
+    spend 30s of every minute asleep. Two EventBridge schedules offset by 30s, each
+    invoking with `polls_per_invocation = 1`, achieves the same cadence inside the
+    free tier. See infra/lambda_collector/README-cadence.md.
+
+    Validated here rather than trusted: a typo that parses as 60 would make one
+    invocation run for an hour and be billed for it.
+    """
+    if value is None:
+        return 1
+    try:
+        polls = int(value)
+    except ValueError as exc:
+        raise ConfigError(
+            f"POLLS_PER_INVOCATION must be an integer, got {value!r}."
+        ) from exc
+
+    if not 1 <= polls <= SCHEDULE_INTERVAL_SECONDS:
+        raise ConfigError(
+            f"POLLS_PER_INVOCATION must be between 1 and "
+            f"{SCHEDULE_INTERVAL_SECONDS} (one pass per second at most), got {polls}."
+        )
+    return polls
 
 
 def _clean(value: str | None) -> str | None:

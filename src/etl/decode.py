@@ -47,7 +47,12 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from google.transit import gtfs_realtime_pb2
 
-from .archive import Snapshot, read_snapshots, snapshot_keys_by_hour
+from .archive import (
+    Snapshot,
+    modal_interval_seconds,
+    read_snapshots,
+    snapshot_keys_by_hour,
+)
 from .config import MIN_PLAUSIBLE_EPOCH_SEC, SERVICE_TZ, EtlConfig
 
 logger = logging.getLogger(__name__)
@@ -314,6 +319,10 @@ def decode_feed(
         "rows": table.num_rows,
         "service_dates": service_dates,
         "snapshots_by_hour": {k: len(v) for k, v in keys_by_hour.items()},
+        # Measured, not assumed. The data-quality report needs it to know what a
+        # complete hour looks like, and the collector's cadence has already changed
+        # once (60s -> 30s) so a constant would describe the wrong era.
+        "interval_seconds": modal_interval_seconds(keys),
         "path": str(destination),
     }
 

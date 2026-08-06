@@ -61,6 +61,8 @@ class SnapshotCoverage:
     feed: str
     hours_checked: int
     complete_hours: int
+    expected_per_hour: int = EXPECTED_SNAPSHOTS_PER_HOUR
+    interval_seconds: int | None = None
     short_hours: list[tuple[str, int]] = field(default_factory=list)
     empty_hours: list[str] = field(default_factory=list)
     pending_hours: list[str] = field(default_factory=list)
@@ -72,14 +74,19 @@ class SnapshotCoverage:
 
     @property
     def missing_snapshots(self) -> int:
-        expected = self.elapsed_hours * EXPECTED_SNAPSHOTS_PER_HOUR
+        expected = self.elapsed_hours * self.expected_per_hour
         observed = (
             sum(count for _, count in self.short_hours)
-            + self.complete_hours * EXPECTED_SNAPSHOTS_PER_HOUR
+            + self.complete_hours * self.expected_per_hour
         )
         return max(expected - observed, 0)
 
     def format(self) -> list[str]:
+        cadence = (
+            f"{self.interval_seconds}s cadence"
+            if self.interval_seconds
+            else "cadence unknown"
+        )
         lines = [
             f"  {self.feed}",
             f"    hours in window      {self.hours_checked}"
@@ -88,14 +95,13 @@ class SnapshotCoverage:
                 if self.pending_hours
                 else ""
             ),
-            f"    complete (>= {EXPECTED_SNAPSHOTS_PER_HOUR})     "
+            f"    measured cadence     {cadence} -> {self.expected_per_hour}/hour",
+            f"    complete (>= {self.expected_per_hour})     "
             f"{self.complete_hours}/{self.elapsed_hours}",
             f"    missing snapshots    {self.missing_snapshots}",
         ]
         for partition, count in self.short_hours[:10]:
-            lines.append(
-                f"    !! SHORT {partition} — {count}/{EXPECTED_SNAPSHOTS_PER_HOUR}"
-            )
+            lines.append(f"    !! SHORT {partition} — {count}/{self.expected_per_hour}")
         if len(self.short_hours) > 10:
             lines.append(f"    ... and {len(self.short_hours) - 10} more short hours")
         for partition in self.empty_hours[:10]:
@@ -124,12 +130,24 @@ def check_snapshot_coverage(
 ) -> SnapshotCoverage:
     """Turn a stage-A summary into a coverage verdict.
 
+    Expected-per-hour comes from the cadence **measured** in this window
+    (`archive.modal_interval_seconds`), not from a constant. The collector's polling
+    interval is a deployment setting that has already changed once, from 60s to 30s.
+    Hardcoding 60 would mean that after the change every hour trivially clears the
+    threshold — 120 files against a 54-file bar — and the coverage check, which is the
+    pipeline's only collector-downtime detector, would silently stop detecting anything.
+
     `now` is injectable so tests can pin it; a check whose result depends on the wall
     clock is otherwise untestable.
     """
     moment = now or datetime.now(UTC)
     by_hour: dict[str, int] = decode_summary["snapshots_by_hour"]
-    threshold = EXPECTED_SNAPSHOTS_PER_HOUR * SHORT_HOUR_TOLERANCE
+
+    interval = decode_summary.get("interval_seconds")
+    expected_per_hour = (
+        max(1, round(3600 / interval)) if interval else EXPECTED_SNAPSHOTS_PER_HOUR
+    )
+    threshold = expected_per_hour * SHORT_HOUR_TOLERANCE
 
     short: list[tuple[str, int]] = []
     empty: list[str] = []
@@ -149,6 +167,8 @@ def check_snapshot_coverage(
         feed=decode_summary["feed"],
         hours_checked=len(by_hour),
         complete_hours=complete,
+        expected_per_hour=expected_per_hour,
+        interval_seconds=interval,
         short_hours=short,
         empty_hours=empty,
         pending_hours=pending,

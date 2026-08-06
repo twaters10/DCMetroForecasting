@@ -10,7 +10,7 @@ pipeline on real data. Those are marked REGRESSION.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -643,3 +643,135 @@ def test_sync_uploads_only_parquet_not_sparks_crc_sidecars(tmp_path):
     assert client.uploaded == [
         "processed/segments/service_date=2026-08-05/part-00000.snappy.parquet"
     ]
+
+
+# --------------------------------------------------------------------------
+# Polling cadence — measured, not assumed
+# --------------------------------------------------------------------------
+
+
+def keys_at(seconds: list[int], feed: str = "rail_vehicle_positions") -> list[str]:
+    """Snapshot keys with the given unix timestamps, in the collector's layout."""
+    return [
+        f"raw/{feed}/year=2026/month=08/day=05/hour=12/{feed}-{t}.pb.gz"
+        for t in seconds
+    ]
+
+
+def test_cadence_is_measured_from_the_keys():
+    """60s and 30s eras are both read correctly from the data itself."""
+    from src.etl.archive import modal_interval_seconds
+
+    assert modal_interval_seconds(keys_at([0, 60, 120, 180])) == 60
+    assert modal_interval_seconds(keys_at([0, 30, 60, 90, 120])) == 30
+
+
+def test_an_outage_gap_does_not_skew_the_measured_cadence():
+    """The mode, not the mean — one 40-minute hole would drag an average far off."""
+    from src.etl.archive import modal_interval_seconds
+
+    stamps = [0, 30, 60, 90, 2490, 2520, 2550]  # 40-minute outage in the middle
+    assert modal_interval_seconds(keys_at(stamps)) == 30
+
+
+@pytest.mark.parametrize("stamps", [[], [0]])
+def test_cadence_is_unknown_when_there_is_no_gap_to_measure(stamps):
+    from src.etl.archive import modal_interval_seconds
+
+    assert modal_interval_seconds(keys_at(stamps)) is None
+
+
+def test_duplicate_keys_do_not_vote_for_a_zero_second_cadence():
+    from src.etl.archive import modal_interval_seconds
+
+    # Three copies of one timestamp plus two real 30s gaps.
+    assert modal_interval_seconds(keys_at([0, 0, 0, 30, 60])) == 30
+
+
+def test_coverage_uses_the_measured_cadence_not_a_constant():
+    """REGRESSION: the only collector-downtime detector, silently broken by 30s polling.
+
+    With EXPECTED_SNAPSHOTS_PER_HOUR hardcoded to 60, a 30s-cadence hour holding 120
+    files trivially clears a 54-file bar — and so does an hour holding 60, which is
+    *half the data missing*. Measuring the cadence keeps the check meaningful.
+    """
+    summary = {
+        "feed": "rail_vehicle_positions",
+        "interval_seconds": 30,
+        "snapshots_by_hour": {
+            "year=2026/month=08/day=05/hour=10/": 120,  # complete at 30s
+            "year=2026/month=08/day=05/hour=11/": 60,  # half missing at 30s
+        },
+    }
+
+    coverage = check_snapshot_coverage(
+        summary, now=datetime(2026, 8, 5, 20, tzinfo=UTC)
+    )
+
+    assert coverage.expected_per_hour == 120
+    assert coverage.complete_hours == 1
+    assert coverage.short_hours == [("year=2026/month=08/day=05/hour=11/", 60)]
+    assert coverage.missing_snapshots == 60
+
+
+def test_coverage_falls_back_to_the_constant_when_cadence_is_unmeasurable():
+    from src.etl.config import EXPECTED_SNAPSHOTS_PER_HOUR
+
+    summary = {
+        "feed": "rail_vehicle_positions",
+        "interval_seconds": None,
+        "snapshots_by_hour": {"year=2026/month=08/day=05/hour=10/": 60},
+    }
+
+    coverage = check_snapshot_coverage(
+        summary, now=datetime(2026, 8, 5, 20, tzinfo=UTC)
+    )
+
+    assert coverage.expected_per_hour == EXPECTED_SNAPSHOTS_PER_HOUR
+    assert coverage.complete_hours == 1
+
+
+def test_negative_duration_is_bounded_by_the_rows_own_bracket(spark, tmp_path):
+    """REGRESSION: a fixed 60s bound is twice as permissive as it should be at 30s.
+
+    A -45s duration is a plausible rounding artefact when the arrival was bracketed by
+    snapshots 60s apart, and impossible when they were 30s apart. The bound has to come
+    from the row, because the archive spans both cadences.
+    """
+    from src.etl.segments import build_segments
+
+    def segment_with(bracket_sec: int, duration_sec: int):
+        rows = [
+            # Stop 1 then stop 2; the lag() pairing turns these into one segment whose
+            # duration is the gap between the two arrival timestamps.
+            {
+                "trip_id": "T1",
+                "trip_run": 0,
+                "scheduled_trip_id": "T1",
+                "schedule_version": "1",
+                "route_id": "RED",
+                "direction_id": 0,
+                "service_date": "2026-08-05",
+                "stop_id": f"PF_{seq}",
+                "stop_sequence": seq,
+                "actual_arrival_ts": at(0) + timedelta(seconds=offset),
+                "arrival_bracket_sec": bracket_sec,
+                "arrival_confident": True,
+                "arrival_source": "vehicle_position",
+                "observed_at_utc": at(0),
+            }
+            for seq, offset in ((1, 0), (2, duration_sec))
+        ]
+        arrivals = spark.createDataFrame(rows)
+        empty_schedule = arrivals.select(
+            "scheduled_trip_id",
+            "service_date",
+            "stop_sequence",
+            arrivals["actual_arrival_ts"].alias("scheduled_arrival_ts"),
+        ).limit(0)
+        built = build_segments(arrivals, empty_schedule, "rail", "test", None).collect()
+        return built[0]
+
+    # -45s duration: within a 60s bracket, outside a 30s one.
+    assert segment_with(60, -45)["duration_plausible"] is True
+    assert segment_with(30, -45)["duration_plausible"] is False

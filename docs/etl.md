@@ -1,6 +1,7 @@
 # Stage 2 — the ETL: how an arrival is derived, and what that costs
 
-The archive holds **state, sampled every 60 seconds**. It contains no record saying
+The archive holds **state, sampled at a fixed interval** — currently 60 seconds (see
+[`polling-cadence.md`](polling-cadence.md) for what a finer cadence would buy). It contains no record saying
 "vehicle arrived at stop X at time T". Every arrival in the segment table is derived,
 and this document is about how, why that way, and what the derivation cannot tell you.
 
@@ -77,15 +78,24 @@ roughly 95% observed, 5% predicted.
 
 ## The sampling-quantization limitation
 
-**Arrival timestamps carry up to ±30 seconds of quantization error, and the segment
-durations built from them up to ±60 seconds.** This is a direct consequence of polling
-once a minute and cannot be reduced without polling faster.
+**Arrival timestamps carry up to half the polling interval in quantization error, and
+the segment durations built from them up to a full interval.** At the current 60s
+cadence that is ±30s and ±60s; halving the interval would halve both. This is a direct consequence of the
+polling rate and cannot be reduced without polling faster — see
+[`polling-cadence.md`](polling-cadence.md).
+
+**Never assume the cadence** even so. Every row carries `arrival_bracket_sec`, measured
+from the two snapshots that actually bracketed that arrival, and the pipeline measures the
+interval per window rather than reading a constant. If the cadence ever changes, the
+archive spans both eras and that column is what keeps the two comparable — use it as a
+feature or a sample weight rather than assuming a single number.
 
 What that means in practice: the median rail segment is 120 seconds. A ±60s error on a
-120s measurement is large in relative terms, and it shows in the output — `delay_sec`
-has p05 −60, median 0, p95 +60. **Those are quantization bins, not delay
-measurements.** Individual rows are not precise enough to say "this train lost 45
-seconds on this segment".
+120s measurement is large in relative terms, and it shows in the 60s-era output —
+`delay_sec` has p05 −60, median 0, p95 +60. **Those are quantization bins, not delay
+measurements.** At 30s the bins halve and real per-segment variation starts to resolve.
+Either way, an individual row is not precise enough to say "this train lost 45 seconds
+on this segment".
 
 The dataset is still useful, because the error is close to unbiased (the midpoint
 estimator is unbiased if arrival is uniform within the interval) and averages out over
@@ -177,7 +187,9 @@ joins it is actually good at. The cost is an intermediate dataset on disk.
 
 ## Known limitations, in one place
 
-1. **±60s duration quantization.** Aggregate-safe, not per-row precise.
+1. **Duration quantization of one polling interval**, currently ±60s. Aggregate-safe,
+   not per-row precise. `arrival_bracket_sec` carries the real figure per row; see
+   `polling-cadence.md`.
 2. **Dwell time is inside `actual_duration_sec`.** No intermediate departures published.
 3. **Repeat runs share one timetable** (17.9% of rows), so their `delay_sec` is
    approximate. Flagged by `trip_run > 0`.

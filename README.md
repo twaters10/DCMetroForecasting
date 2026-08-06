@@ -110,4 +110,5 @@ table = read_segments(config, ["2026-08-05"])        # one date
 ```
 
 See [`docs/etl.md`](docs/etl.md) for how arrivals are derived and what the data cannot
-tell you.
+tell you, and [`docs/polling-cadence.md`](docs/polling-cadence.md) for what a finer polling
+cadence would buy, what it costs, and why the cheap approach does not work.
