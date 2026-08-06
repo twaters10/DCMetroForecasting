@@ -78,15 +78,23 @@ for why the schedule join keys on `scheduled_trip_id`.
 
 ### Unattended
 
-A launchd job runs `src.etl.catchup` daily. It processes every *complete* service day
-missing from S3 rather than "yesterday", so a missed run — a closed laptop, a holiday —
-costs nothing and the next run catches up. Install steps are in
-[`runbook.txt`](runbook.txt) §5A.
+A GitHub Actions workflow ([`.github/workflows/etl-daily.yml`](.github/workflows/etl-daily.yml))
+runs `src.etl.catchup` daily at 07:00 UTC. It processes every *complete* service day
+missing from S3 rather than "yesterday", so a skipped or delayed run costs nothing and
+the next one catches up. One-time AWS OIDC setup is in
+[`docs/ci-setup.md`](docs/ci-setup.md).
+
+Locally, whenever you want:
 
 ```bash
-python -m src.etl.catchup --dry-run    # what is outstanding
-python -m src.etl.catchup              # process it, then sync to S3
+./scripts/run_etl_daily.sh --dry-run   # what is outstanding
+./scripts/run_etl_daily.sh             # process it, then sync to S3
 ```
+
+The wrapper sets `AWS_PROFILE` and `JAVA_HOME` itself, so nothing needs exporting.
+A local `launchd` schedule is *not* used — macOS TCC blocks a LaunchAgent from reading
+anything under `~/Documents`, so it cannot execute the pipeline at all
+([`docs/ci-setup.md`](docs/ci-setup.md) has the detail).
 
 ### Reading the segment table
 

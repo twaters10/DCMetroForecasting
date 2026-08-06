@@ -1,0 +1,139 @@
+# Daily ETL: raw GTFS-realtime snapshots -> trip-segment table in S3.
+#
+# Runs here rather than on a laptop for one concrete reason: macOS TCC denies a
+# LaunchAgent read access to anything under ~/Documents, where this repo lives, so a
+# local schedule cannot execute the pipeline at all (exit 126, "Operation not
+# permitted"). A hosted runner has no such constraint and is awake every night.
+#
+# What this does NOT do is decide which dates to process. `src.etl.catchup` asks S3
+# which complete service days are missing and processes those, so a skipped or delayed
+# run costs nothing and the real deadline is the 90-day raw/ retention. That property
+# is what makes an unattended schedule safe; see docs/etl.md.
+
+name: etl-daily
+
+on:
+  schedule:
+    # 07:00 UTC. A service day closes at 04:00 UTC under EDT and 05:00 UTC under EST,
+    # and GitHub cron is always UTC with no DST handling — 07:00 clears both with
+    # margin. GitHub may delay scheduled runs under load; the catch-up logic absorbs it.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which mode to process"
+        type: choice
+        options: [rail, bus]
+        default: rail
+      lookback_days:
+        description: "How far back to look for gaps"
+        default: "14"
+      force:
+        description: "Reprocess dates already present in S3"
+        type: boolean
+        default: false
+
+# Never two runs at once. A backlog catch-up can outlast the gap to the next firing,
+# and two runs writing the same service_date partition would race.
+concurrency:
+  group: etl-daily
+  cancel-in-progress: false
+
+permissions:
+  # `id-token` is what lets the runner assume the AWS role via OIDC. Without it the
+  # aws-actions step fails with a confusing "Credentials could not be loaded".
+  id-token: write
+  contents: read
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    # A rail service day is ~72s locally; deps install dominates. Generous enough for a
+    # multi-day backlog, tight enough that a hang does not burn an hour of minutes.
+    timeout-minutes: 45
+
+    env:
+      # .env is gitignored (it holds the WMATA key), so configuration comes from repo
+      # variables. src/etl/config.py loads .env with override=False, so these win and
+      # the absence of the file is fine.
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      S3_PREFIX: raw/
+      S3_STATIC_PREFIX: static/
+      S3_PROCESSED_PREFIX: processed/
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Set up Java
+        # PySpark needs a JVM. Pinned rather than relying on whatever the runner image
+        # ships, so a base-image change cannot silently move the Spark version's
+        # supported JDK out from under us.
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        # The suite is offline and takes ~20s. Running it before touching S3 means a
+        # broken derivation is caught before it writes anything.
+        run: python -m pytest tests/ -q
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: etl-daily-${{ github.run_id }}
+
+      - name: Verify identity and configuration
+        # Fails early with a readable message rather than deep inside the pipeline.
+        run: |
+          test -n "$S3_BUCKET" || { echo "::error::repo variable S3_BUCKET is not set"; exit 1; }
+          aws sts get-caller-identity
+          aws s3 ls "s3://$S3_BUCKET/" >/dev/null
+
+      - name: Process outstanding service days
+        # Deliberately NOT scripts/run_etl_daily.sh: that wrapper exports
+        # AWS_PROFILE=metro-pulse for local use, which on a runner would override the
+        # OIDC credentials this job just assumed and fail to resolve any profile at all.
+        # The wrapper is for laptops; CI calls the module.
+        #
+        # `set -o pipefail` is load-bearing. GitHub's default shell is `bash -e`, which
+        # does NOT set pipefail, so piping through `tee` would report the exit status of
+        # `tee` — always 0 — and a failed ETL would show as a green run.
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          python -m src.etl.catchup \
+            --mode "${{ inputs.mode || 'rail' }}" \
+            --lookback-days "${{ inputs.lookback_days || '14' }}" \
+            ${{ inputs.force == true && '--force' || '' }} \
+            2>&1 | tee "logs/etl-$(date -u +%Y-%m-%dT%H%M).log"
+
+      - name: Report what is now in S3
+        if: always()
+        run: |
+          aws s3 ls "s3://$S3_BUCKET/processed/segments/" --recursive --human-readable \
+            || echo "could not list processed/ — see earlier failures"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etl-log-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 30
