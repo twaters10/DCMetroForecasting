@@ -32,7 +32,7 @@ from pathlib import Path
 from .archive import earliest_snapshot
 from .config import FEEDS_BY_MODE, SERVICE_TZ, EtlConfig
 from .processed import completed_service_dates, sync_partitions
-from .schedule import service_day_start
+from .schedule import service_day_end, service_day_start
 
 logger = logging.getLogger("catchup")
 
@@ -76,8 +76,8 @@ def pending_service_dates(
 
     pending: list[str] = []
     for candidate in candidates:
-        if now < service_day_start(candidate + timedelta(days=1)):
-            continue  # the day has not finished yet
+        if now < service_day_end(candidate):
+            continue  # the day has not finished yet — it runs past local midnight
         if archive_start is not None and service_day_start(candidate) < archive_start:
             continue  # the archive does not go back this far
         iso = candidate.isoformat()

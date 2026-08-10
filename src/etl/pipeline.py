@@ -38,7 +38,12 @@ from .archive import (
 from .config import FEEDS_BY_MODE, SERVICE_TZ, EtlConfig
 from .decode import decode_feed
 from .quality import QualityReport, check_segments, check_snapshot_coverage
-from .schedule import build_match_report, scheduled_stop_times, service_day_start
+from .schedule import (
+    build_match_report,
+    scheduled_stop_times,
+    service_day_end,
+    service_day_start,
+)
 from .spark import build_session
 
 logger = logging.getLogger("etl")
@@ -64,28 +69,32 @@ def fully_covered_service_dates(start: datetime, end: datetime) -> list[str]:
     seen but not covered are skipped and logged, so they can be run deliberately.
     """
     covered: list[str] = []
-    cursor = start.astimezone(SERVICE_TZ).date()
+    cursor = start.astimezone(SERVICE_TZ).date() - timedelta(days=1)
     last = end.astimezone(SERVICE_TZ).date()
     while cursor <= last:
-        day_start = service_day_start(cursor)
-        day_end = service_day_start(cursor + timedelta(days=1))
-        if start <= day_start and day_end <= end:
+        # `service_day_end` runs past local midnight, so a window must cover that
+        # overhang to be authoritative for the day. Using local midnight here was the
+        # bug: it declared a day fully covered while the last hours of it sat outside
+        # the decoded window.
+        if start <= service_day_start(cursor) and service_day_end(cursor) <= end:
             covered.append(cursor.isoformat())
         cursor += timedelta(days=1)
     return covered
 
 
 def service_day_bounds(service_date: str) -> tuple[datetime, datetime]:
-    """UTC window covering one America/New_York service day.
+    """UTC window covering one America/New_York service day, overhang included.
 
-    A local day is not a UTC day. Converting the local start and end explicitly means
-    `--date` reads a full local day (and 25 hours of UTC on the fall-back date) rather
-    than a UTC day that clips four hours off each end.
+    A local day is not a UTC day, and a GTFS *service* day is not a local day either. It
+    starts at noon minus twelve hours and runs past the following midnight, so this uses
+    `service_day_start`/`service_day_end` rather than constructing local midnights.
+
+    The previous version built naive local midnights, which was wrong twice over: it
+    disagreed with `service_day_start` on DST boundaries, and it stopped at midnight and
+    so excluded the late-night tail — 424 vehicle-records for one service date.
     """
     day = datetime.fromisoformat(service_date).date()
-    start_local = datetime.combine(day, datetime.min.time(), tzinfo=SERVICE_TZ)
-    end_local = start_local + timedelta(days=1)
-    return start_local.astimezone(UTC), end_local.astimezone(UTC)
+    return service_day_start(day), service_day_end(day)
 
 
 def main(argv: list[str] | None = None) -> int:

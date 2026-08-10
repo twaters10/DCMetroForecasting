@@ -80,6 +80,17 @@ MAX_ARRIVAL_BRACKET_SEC: Final[int] = 3 * SAMPLING_QUANTIZATION_SEC
 # over predictions. Anything below this floor is a sentinel, not a time.
 MIN_PLAUSIBLE_EPOCH_SEC: Final[int] = 1_000_000_000
 
+# How far past local midnight a service day keeps running. A GTFS service day is not a
+# calendar day — that is why the spec allows stop times beyond 24:00:00 — so any window
+# that ends at midnight drops the late-night tail of every day.
+#
+# Measured on this archive: trips carrying `start_date = D` still run 3.5 hours past
+# local midnight, and the tail thins out naturally rather than being clipped by the
+# sample window. Four hours covers that with margin. Raising it is cheap; the overlap it
+# creates between consecutive days' windows is handled by per-window staging writes plus
+# the dedup on read in the pipeline.
+SERVICE_DAY_OVERHANG_HOURS: Final[int] = 4
+
 # Non-revenue equipment moves. These carry a trip_id but no schedule, so they will
 # never join to static GTFS and must be excluded *before* computing a match rate —
 # otherwise normal non-revenue traffic is indistinguishable from a real regression.
