@@ -31,7 +31,7 @@ from typing import Final
 import pandas as pd
 
 from .archive import StaticBundle
-from .config import NON_REVENUE_ROUTE_ID, SERVICE_TZ
+from .config import NON_REVENUE_ROUTE_ID, SERVICE_DAY_OVERHANG_HOURS, SERVICE_TZ
 
 # `12345678_20670` -> `12345678`. Anchored so a stray underscore inside an id cannot
 # silently truncate it, and tolerant of ids with no suffix at all (non-revenue moves
@@ -84,6 +84,27 @@ def service_day_start(service_date: date) -> datetime:
     """
     noon_local = datetime.combine(service_date, time(12), tzinfo=SERVICE_TZ)
     return noon_local.astimezone(UTC) - timedelta(hours=12)
+
+
+def service_day_end(service_date: date) -> datetime:
+    """The instant a GTFS service day stops, in UTC.
+
+    **Not local midnight.** A service day runs past midnight into the next calendar
+    day — the whole reason GTFS permits stop times beyond 24:00:00 — so a window ending
+    at midnight silently drops the late-night tail of every day.
+
+    Measured on this archive: trips carrying `start_date = D` are still running **3.5
+    hours** past local midnight, and the tail thins out naturally rather than being cut
+    off by the sampling window. The four-hour overhang covers that with margin.
+
+    The symptom of getting this wrong is easy to miss: the segment table simply has no
+    rows at local hours 0-3, and the 23:00 hour tapers, which reads as "service stops at
+    midnight" rather than as a bug. 424 vehicle-records for one service date sat outside
+    the old window.
+    """
+    return service_day_start(service_date + timedelta(days=1)) + timedelta(
+        hours=SERVICE_DAY_OVERHANG_HOURS
+    )
 
 
 def scheduled_timestamp(service_date: date, gtfs_time: str) -> datetime | None:

@@ -565,14 +565,62 @@ def pending(now, done=frozenset(), lookback=14, force=False, archive=ARCHIVE_STA
 
 
 def test_a_service_day_is_not_pending_until_it_closes():
-    """The day closes at 04:00 UTC the next day, not at local midnight.
+    """REGRESSION: a service day runs PAST local midnight, and the window must too.
 
-    Processing it earlier writes a partition missing its evening, and nothing
-    downstream can tell it apart from a complete one.
+    Aug 6's service day starts at 04:00 UTC Aug 6 (local midnight) and ends four hours
+    after the *next* local midnight — 08:00 UTC Aug 7 — because trips carrying
+    `start_date = 2026-08-06` are still running 3.5 hours into Aug 7 local time.
+
+    Closing at local midnight, as this originally did, left 424 vehicle-records for a
+    single service date outside the window. The symptom was subtle: the segment table
+    simply had no rows at local hours 0-3, which reads as "service stops at midnight"
+    rather than as a bug.
     """
-    # 03:59 UTC on Aug 7 — Aug 6's service day has not quite ended.
-    assert "2026-08-06" not in pending(datetime(2026, 8, 7, 3, 59, tzinfo=UTC))
-    assert "2026-08-06" in pending(datetime(2026, 8, 7, 4, 0, tzinfo=UTC))
+    from src.etl.schedule import service_day_end
+
+    assert service_day_end(date(2026, 8, 6)) == datetime(2026, 8, 7, 8, tzinfo=UTC)
+
+    # One second before the day closes, and exactly at it.
+    assert "2026-08-06" not in pending(datetime(2026, 8, 7, 7, 59, tzinfo=UTC))
+    assert "2026-08-06" in pending(datetime(2026, 8, 7, 8, 0, tzinfo=UTC))
+
+    # The old boundary must no longer be treated as closing time.
+    assert "2026-08-06" not in pending(datetime(2026, 8, 7, 4, 0, tzinfo=UTC))
+
+
+def test_service_day_window_includes_the_post_midnight_overhang():
+    """`--date D` must decode past local midnight, or it clips D's late-night tail."""
+    from src.etl.pipeline import service_day_bounds
+
+    start, end = service_day_bounds("2026-08-07")
+
+    assert start == datetime(2026, 8, 7, 4, tzinfo=UTC)  # local midnight
+    assert end == datetime(2026, 8, 8, 8, tzinfo=UTC)  # +4h past the next one
+    assert (end - start).total_seconds() / 3600 == 28
+
+
+def test_window_spans_28_hours_across_both_dst_transitions():
+    """The overhang must not silently become 27 or 29 hours twice a year."""
+    from src.etl.pipeline import service_day_bounds
+
+    for day in ("2026-03-08", "2026-11-01", "2026-08-07"):
+        start, end = service_day_bounds(day)
+        assert (end - start).total_seconds() / 3600 == 28, day
+
+
+def test_coverage_requires_the_overhang_not_just_midnight():
+    """A window stopping at local midnight is NOT authoritative for that service day."""
+    from src.etl.pipeline import fully_covered_service_dates
+    from src.etl.schedule import service_day_start
+
+    start = service_day_start(date(2026, 8, 7))
+    to_midnight = service_day_start(date(2026, 8, 8))  # the old, wrong end
+    assert fully_covered_service_dates(start, to_midnight) == []
+
+    _, proper_end = __import__(
+        "src.etl.pipeline", fromlist=["service_day_bounds"]
+    ).service_day_bounds("2026-08-07")
+    assert fully_covered_service_dates(start, proper_end) == ["2026-08-07"]
 
 
 def test_dates_before_the_archive_begins_are_never_proposed():
