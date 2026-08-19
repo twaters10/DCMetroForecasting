@@ -30,6 +30,11 @@ pyspark==4.2.0
 pandas==3.0.5
 pyarrow==25.0.0
 
+# Same reasoning, one layer up: the feature modules (`baselines.py`,
+# `historical.py`, `safe.py`) import numpy directly rather than reaching it
+# through pandas, so it is declared rather than inherited.
+numpy==2.5.1
+
 # --------------------------------------------------------------------------
 # Feed parsing — matched to the collector
 # --------------------------------------------------------------------------
