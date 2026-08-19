@@ -30,6 +30,17 @@ _JDK_CANDIDATES: Final[tuple[str, ...]] = (
 # to be efficient, large enough to use the cores.
 DEFAULT_SHUFFLE_PARTITIONS: Final[int] = 8
 
+# Spark's default driver heap is 1g. In local mode the driver *is* the executor, so
+# `local[*]` on a 10-core laptop runs ten concurrent tasks inside that one 1g heap —
+# about 100MB each. Deriving arrivals sorts a day of trip updates under window
+# functions and does not fit, which surfaces as `OutOfMemoryError: Java heap space`
+# followed by a confusing NullPointerException from `dagScheduler()` being null: the
+# context is already dead by the time the next collect() reports it.
+#
+# 4g against a 16GB machine leaves room for the OS and the Python side while giving
+# each task real headroom. Raise it for bus, which is ~10x the volume.
+DEFAULT_DRIVER_MEMORY: Final[str] = "4g"
+
 
 class JavaNotFoundError(RuntimeError):
     """Raised when no JVM can be located, with instructions rather than a stack."""
@@ -74,14 +85,35 @@ def pin_worker_interpreter() -> str:
     return sys.executable
 
 
+def set_driver_memory(memory: str = DEFAULT_DRIVER_MEMORY) -> str:
+    """Raise the driver heap, before the JVM exists to have one.
+
+    This cannot be done with `SparkSession.builder.config("spark.driver.memory", ...)`.
+    By the time a SparkConf is applied, py4j has already launched the JVM and its -Xmx
+    is fixed, so the setting is accepted, reported back by `spark.conf.get`, and has no
+    effect whatsoever — the worst kind of silent no-op. The launcher reads
+    PYSPARK_SUBMIT_ARGS instead, which is consulted before the process starts.
+
+    The trailing `pyspark-shell` is required: PYSPARK_SUBMIT_ARGS is parsed as a
+    spark-submit command line and the launcher looks for that token as the "primary
+    resource" terminating the argument list. Without it the JVM fails to start.
+    """
+    os.environ.setdefault(
+        "PYSPARK_SUBMIT_ARGS", f"--driver-memory {memory} pyspark-shell"
+    )
+    return memory
+
+
 def build_session(
     app_name: str = "metro-pulse-etl",
     shuffle_partitions: int = DEFAULT_SHUFFLE_PARTITIONS,
     cores: str = "*",
+    driver_memory: str = DEFAULT_DRIVER_MEMORY,
 ) -> SparkSession:
     """Build a local SparkSession configured for this workload."""
     ensure_java_home()
     pin_worker_interpreter()
+    set_driver_memory(driver_memory)
 
     from pyspark.sql import SparkSession
 
