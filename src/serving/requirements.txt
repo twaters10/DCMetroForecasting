@@ -1,0 +1,18 @@
+# Installed by the SageMaker framework container at cold start, from code/requirements.txt
+# inside model.tar.gz. Keep this minimal — every line lengthens every cold start.
+#
+# The base SKLearn container already ships numpy, pandas and scikit-learn. Only what it
+# lacks is listed here.
+#
+# pyarrow is deliberately ABSENT. It was here to read two Parquet files and is 126 MB
+# installed, against LightGBM's 5.5 MB. Those files ship as CSV instead, which pandas
+# reads natively, so a serverless cold start now installs one small wheel.
+
+# 4.6.0, NOT the 4.7.0 used for training. The sklearn 1.2-1 container runs Python 3.9
+# and LightGBM 4.7.0 requires >=3.10, so pip finds no candidate and the model process
+# exits during startup.
+#
+# The version skew is verified, not assumed: 4.6.0 loading the 4.7.0-written model.txt
+# reproduces its predictions to a maximum absolute difference of 0.0 across a sample of
+# journeys. Re-check this if the training version moves again.
+lightgbm==4.6.0
