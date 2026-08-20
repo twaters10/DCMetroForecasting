@@ -477,3 +477,147 @@ def test_package_flattens_for_sagemaker(tmp_path):
     assert not any("/" in n for n in names), "nested paths break the serving handler"
     # Evaluation evidence must not bloat every container pull.
     assert not any(n.endswith(".png") or n.endswith(".parquet") for n in names)
+
+
+def test_package_puts_inference_code_under_code_dir(tmp_path):
+    """Framework containers look for the handler in `code/`, not at the root.
+
+    The flat layout is right for model files and wrong for inference code — SageMaker
+    runs `pip install -r code/requirements.txt` at cold start, which is what puts
+    LightGBM in the container.
+    """
+    import tarfile
+    from datetime import UTC, datetime
+
+    from src.models.artifacts import new_run_dir, package
+
+    run = new_run_dir(tmp_path / "m", datetime(2026, 8, 20, 14, 0, tzinfo=UTC))
+    for name in ("model.txt", "encoder.json", "feature_columns.json", "manifest.json"):
+        (run / name).write_text("{}")
+
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "inference.py").write_text("def model_fn(d): ...")
+    (code / "requirements.txt").write_text("lightgbm==4.7.0")
+
+    serving = tmp_path / "serving"
+    serving.mkdir()
+    (serving / "station_index.json").write_text("{}")
+
+    archive = package(
+        run,
+        serving_dir=serving,
+        code_files={p.name: p for p in code.iterdir()},
+    )
+    with tarfile.open(archive) as tar:
+        names = set(tar.getnames())
+
+    assert "model.txt" in names
+    assert "code/inference.py" in names
+    assert "code/requirements.txt" in names
+    # Serving inputs travel WITH the model — the handler loads them from the model dir,
+    # so an endpoint without them starts and then fails on its first request.
+    assert "station_index.json" in names
+
+
+def test_package_default_stays_flat(tmp_path):
+    """Without code_files the archive is still flat — the old contract is unchanged."""
+    import tarfile
+    from datetime import UTC, datetime
+
+    from src.models.artifacts import new_run_dir, package
+
+    run = new_run_dir(tmp_path / "m", datetime(2026, 8, 20, 15, 0, tzinfo=UTC))
+    (run / "model.txt").write_text("x")
+    (run / "plots" / "learning_curve.png").write_bytes(b"png")
+
+    with tarfile.open(package(run)) as tar:
+        names = tar.getnames()
+    assert names == ["model.txt"]
+
+
+# ------------------------------------------------------------------ station resolver
+
+
+def _index():
+    from src.serving.stations import StationIndex
+
+    return StationIndex(
+        names_to_codes={"vienna": ["K08"], "metro center": ["A01", "C01"]},
+        code_to_name={"K08": "Vienna", "A01": "Metro Center", "C01": "Metro Center"},
+        code_to_platforms={
+            "K08": ["PF_K08_C"],
+            "A01": ["PF_A01_1"],
+            "C01": ["PF_C01_1"],
+        },
+    )
+
+
+def _schedule(rows):
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "origin",
+            "destination",
+            "hour",
+            "sched_sec",
+            "n_segments",
+            "stop_span",
+            "trips",
+            "route_id",
+            "direction_id",
+            "first_leg_to",
+        ],
+    )
+
+
+def test_station_names_normalise():
+    """'metro center', 'Metro Center' and 'METRO  CENTER' are the same station."""
+    from src.serving.stations import normalise
+
+    assert normalise("Metro Center") == normalise("metro  center") == "metro center"
+    # Punctuation must not defeat a lookup — L'Enfant is the real case.
+    assert normalise("L'Enfant Plaza") == "l enfant plaza"
+
+
+def test_unknown_station_suggests_rather_than_crashes():
+    from src.serving.stations import StationError
+
+    with pytest.raises(StationError, match="did you mean Vienna"):
+        _index().candidates("Viena")
+
+
+def test_transfer_station_resolves_via_the_connected_platform():
+    """Metro Center has two codes; only one is connected to the destination."""
+    from src.serving.stations import ANY_HOUR, resolve_journey
+
+    schedule = _schedule(
+        [("PF_A01_1", "PF_K08_C", ANY_HOUR, 900, 6, 6, 20, "RED", 0, "PF_A02_1")]
+    )
+    out = resolve_journey("Metro Center", "Vienna", _index(), schedule)
+    assert out["origin_stop_id"] == "PF_A01_1"
+    assert out["scheduled_total_sec"] == 900
+    # The first leg is what the recent-conditions lookup is keyed on.
+    assert out["first_leg_to"] == "PF_A02_1"
+
+
+def test_genuinely_ambiguous_journey_is_refused_not_guessed():
+    """Both platforms connected means we cannot know which the rider meant."""
+    from src.serving.stations import ANY_HOUR, StationError, resolve_journey
+
+    schedule = _schedule(
+        [
+            ("PF_A01_1", "PF_K08_C", ANY_HOUR, 900, 6, 6, 20, "RED", 0, "PF_A02_1"),
+            ("PF_C01_1", "PF_K08_C", ANY_HOUR, 700, 5, 5, 20, "BLUE", 0, "PF_C02_1"),
+        ]
+    )
+    with pytest.raises(StationError, match="ambiguous"):
+        resolve_journey("Metro Center", "Vienna", _index(), schedule)
+
+
+def test_unconnected_stations_are_refused():
+    """No single train runs between them — the model cannot answer transfers."""
+    from src.serving.stations import StationError, resolve_journey
+
+    with pytest.raises(StationError, match="no scheduled trip"):
+        resolve_journey("Vienna", "Metro Center", _index(), _schedule([]))

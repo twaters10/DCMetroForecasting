@@ -193,22 +193,42 @@ def write_manifest(
     return path
 
 
-def package(run: Path, output: Path | None = None) -> Path:
-    """Tar a run into the `model.tar.gz` layout SageMaker expects.
+def package(
+    run: Path,
+    output: Path | None = None,
+    serving_dir: Path | None = None,
+    code_files: dict[str, Path] | None = None,
+) -> Path:
+    """Tar a run into the `model.tar.gz` layout a SageMaker framework container expects.
 
-    Members are stored at the archive root rather than under the run directory name,
-    because SageMaker extracts straight into `/opt/ml/model` and a nested folder would
-    put the model one level deeper than the inference handler looks.
+    Model files sit at the archive root, because SageMaker extracts straight into
+    `/opt/ml/model` and a nested folder would put them a level deeper than the handler
+    looks. **Inference code is the exception**: framework containers look for it under
+    `code/`, and `code/requirements.txt` is what installs LightGBM at cold start.
 
-    Plots and validation predictions are excluded — they are evaluation evidence, not
-    serving inputs, and shipping them bloats every container pull.
+    Serving inputs (station index, journey schedule, recent-conditions lookup) are
+    copied in too — the handler loads them from the model directory, so they must travel
+    with the model, or the endpoint starts and then fails on its first request.
+
+    Plots and validation predictions are excluded: evaluation evidence, not serving
+    inputs, and shipping them bloats every container pull.
     """
     output = output or run / "model.tar.gz"
-    keep = {"model.txt", "encoder.json", "feature_columns.json", "manifest.json"}
+    root_files = {"model.txt", "encoder.json", "feature_columns.json", "manifest.json"}
+
     with tarfile.open(output, "w:gz") as tar:
-        for name in sorted(keep):
+        for name in sorted(root_files):
             path = run / name
             if path.exists():
                 tar.add(path, arcname=name)
+
+        if serving_dir:
+            for path in sorted(Path(serving_dir).glob("*")):
+                if path.is_file():
+                    tar.add(path, arcname=path.name)
+
+        for arcname, path in sorted((code_files or {}).items()):
+            tar.add(path, arcname=f"code/{arcname}")
+
     logger.info("packaged %s (%.1f KB)", output, output.stat().st_size / 1024)
     return output
