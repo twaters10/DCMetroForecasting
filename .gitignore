@@ -25,6 +25,12 @@ data/staging/
 data/staging-*/
 data/processed/
 data/cache/
+data/data_dictionary.xlsx
+data/
+
+# Trained models and their encoder mappings. Reproducible from the feature table, and
+# a model binary in git is a merge conflict waiting to happen.
+data/models/
 
 # OS
 .DS_Store

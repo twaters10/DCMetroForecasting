@@ -131,6 +131,11 @@ def build_session(
         # what makes "re-run one day" safe next to a month of existing output.
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
         .config("spark.ui.enabled", "false")
+        # Spark's console progress bar is built from carriage returns and is meant for
+        # a TTY. Piped to `tee` it renders as thousands of `[Stage 72:===>]` fragments
+        # on one enormous line, in the terminal AND in logs/etl-YYYY-MM.log. Our own
+        # stage logging covers "where is it up to" in a form that survives a log file.
+        .config("spark.ui.showConsoleProgress", "false")
         .getOrCreate()
     )
     session.sparkContext.setLogLevel("ERROR")

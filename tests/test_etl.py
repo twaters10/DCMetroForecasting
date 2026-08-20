@@ -823,3 +823,122 @@ def test_negative_duration_is_bounded_by_the_rows_own_bracket(spark, tmp_path):
     # -45s duration: within a 60s bracket, outside a 30s one.
     assert segment_with(60, -45)["duration_plausible"] is True
     assert segment_with(30, -45)["duration_plausible"] is False
+
+
+# ---------------------------------------------------------------- progress logging
+
+
+def test_duration_is_compact_at_every_scale():
+    from src.etl.progress import format_duration
+
+    assert format_duration(0) == "0s"
+    assert format_duration(45) == "45s"
+    assert format_duration(192) == "3m12s"
+    assert format_duration(3840) == "1h04m"
+    # A negative elapsed is impossible but must not render as "-1s" if a clock jumps.
+    assert format_duration(-5) == "0s"
+
+
+def test_progress_is_throttled_not_per_item(caplog):
+    """2,880 snapshots must not produce 2,880 log lines."""
+    import logging
+
+    from src.etl.progress import Progress
+
+    logger = logging.getLogger("test.progress.throttle")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        progress = Progress(logger, total=2880, label="snapshots", every_seconds=3600)
+        for _ in range(2880):
+            progress.advance()
+
+    assert caplog.records == [], "throttling should suppress every interim line here"
+    assert progress.count == 2880
+
+
+def test_progress_always_reports_a_final_line(caplog):
+    """A job that finishes inside the throttle window still has to say it finished."""
+    import logging
+
+    from src.etl.progress import Progress
+
+    logger = logging.getLogger("test.progress.final")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        progress = Progress(logger, total=10, label="snapshots", every_seconds=3600)
+        progress.advance(10)
+        progress.done()
+
+    assert len(caplog.records) == 1
+    assert "complete" in caplog.records[0].getMessage()
+
+
+def test_progress_survives_an_unknown_total(caplog):
+    """total=0 must not divide by zero — a streaming source has no count."""
+    import logging
+
+    from src.etl.progress import Progress
+
+    logger = logging.getLogger("test.progress.zero")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        progress = Progress(logger, total=0, label="rows", every_seconds=0)
+        progress.advance()
+        progress.done()
+
+    assert any("rows" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------- staging window restriction
+
+
+def _stage_observations(root, feed, captured, service_dates):
+    """Write staged trip-update observations the way stage A lays them out."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table(
+        {
+            "captured_at": pa.array(captured, pa.timestamp("ms", tz="UTC")),
+            "trip_id": pa.array([f"T{i}" for i in range(len(captured))]),
+            "route_id": pa.array(["RED"] * len(captured)),
+            "service_date": pa.array(service_dates),
+        }
+    )
+    pq.write_to_dataset(table, root / feed, partition_cols=["service_date"])
+
+
+def test_staging_reads_are_restricted_to_the_decoded_window(tmp_path):
+    """Staging accumulates; reading all of it changes the output, not just the stats.
+
+    Measured on 2026-08-18 with 7 days staged: the schedule match rate read 79.3% and
+    failed the quality gate, and 4.9% of the date's segments were LOST because
+    `assign_trip_runs` sessionises by gaps within a reused trip_id. Both call sites now
+    filter on `captured_at`; this pins the boundary rule they share.
+    """
+    import pyarrow.dataset as ds
+
+    start = datetime(2026, 8, 18, 4, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 19, 8, 0, tzinfo=UTC)
+
+    captured = [
+        start - timedelta(hours=1),  # before  -> excluded
+        start,  # inclusive lower bound -> kept
+        start + timedelta(hours=12),  # inside -> kept
+        end,  # exclusive upper bound -> excluded
+        end + timedelta(hours=1),  # after -> excluded
+    ]
+    dates = ["2026-08-17", "2026-08-18", "2026-08-18", "2026-08-19", "2026-08-19"]
+    _stage_observations(tmp_path, "rail_trip_updates", captured, dates)
+
+    kept = (
+        ds.dataset(
+            tmp_path / "rail_trip_updates", format="parquet", partitioning="hive"
+        )
+        .to_table(
+            columns=["trip_id"],
+            filter=(ds.field("captured_at") >= start) & (ds.field("captured_at") < end),
+        )
+        .to_pandas()
+    )
+
+    # Half-open [start, end): the upper bound belongs to the NEXT window, and counting
+    # it in both would double-count one snapshot across consecutive runs.
+    assert sorted(kept["trip_id"]) == ["T1", "T2"]

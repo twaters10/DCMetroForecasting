@@ -52,12 +52,24 @@ LOG_FILE="$LOG_DIR/etl-$(date +%Y-%m).log"
   echo "================================================================================"
   echo "run started $(date -u '+%Y-%m-%dT%H:%M:%SZ')  (local $(date '+%Y-%m-%d %H:%M %Z'))"
   echo "================================================================================"
-} >>"$LOG_FILE"
+} | tee -a "$LOG_FILE"
 
+# Output goes to BOTH the terminal and the log. It used to be `>>"$LOG_FILE" 2>&1`,
+# which sent every byte to the file and left an interactive run looking hung for the
+# ten-plus minutes a multi-day catch-up takes.
+#
+# `-u` is load-bearing, not decoration. Python line-buffers stdout only when it is a
+# TTY; behind a pipe it switches to 4-8KB block buffering, so progress would arrive in
+# bursts minutes after the work happened — which looks exactly like the hang this is
+# meant to cure. `-u` forces unbuffered writes.
+#
+# `set -o pipefail` (set at the top) is equally load-bearing: without it the pipeline's
+# status is `tee`'s, which is always 0, and a failed ETL would exit green.
+#
 # `set -e` would abort before the exit status could be logged, so the failure is
 # captured explicitly and re-raised at the end.
 status=0
-"$PYTHON" -m src.etl.catchup "$@" >>"$LOG_FILE" 2>&1 || status=$?
+"$PYTHON" -u -m src.etl.catchup "$@" 2>&1 | tee -a "$LOG_FILE" || status=$?
 
-echo "run finished status=$status $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >>"$LOG_FILE"
+echo "run finished status=$status $(date -u '+%Y-%m-%dT%H:%M:%SZ')" | tee -a "$LOG_FILE"
 exit "$status"
