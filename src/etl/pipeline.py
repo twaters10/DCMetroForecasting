@@ -28,6 +28,7 @@ from pathlib import Path
 
 import boto3
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from .archive import (
@@ -196,9 +197,20 @@ def main(argv: list[str] | None = None) -> int:
     bundle = resolve_static_bundle(s3, config, args.mode, service_date)
     logger.info("static bundle %s (version %s)", bundle.key, bundle.schedule_version)
 
-    observations_for_report = pq.read_table(
-        staging / tu_feed, columns=["trip_id", "route_id"]
-    ).to_pandas()
+    # Same window restriction as stage B, and for the same reason. Read unfiltered,
+    # this statistic covers every date staged rather than the one being processed: on
+    # 2026-08-18 it reported 79.3% and failed the quality gate, because staged rows from
+    # before a timetable rollover cannot join the bundle this window loaded. Those rows
+    # are discarded further down, so the gate was blocking a good service date over data
+    # that never reaches the output. The filtered figure for the same run is 100.0%.
+    observations_for_report = (
+        ds.dataset(staging / tu_feed, format="parquet", partitioning="hive")
+        .to_table(
+            columns=["trip_id", "route_id"],
+            filter=(ds.field("captured_at") >= start) & (ds.field("captured_at") < end),
+        )
+        .to_pandas()
+    )
     match_report = build_match_report(observations_for_report, bundle)
 
     schedule_frame = scheduled_stop_times(bundle)
@@ -229,11 +241,35 @@ def main(argv: list[str] | None = None) -> int:
         # is safe, and doing it here keeps stage A from having to reason about overlap.
         # Left un-deduplicated, a repeated observation becomes a repeated arrival and
         # then a zero-duration segment.
-        vp_obs = spark.read.parquet(str(staging / vp_feed)).dropDuplicates(
-            ["captured_at", "trip_id"]
+        # Restrict to the window stage A decoded. Staging accumulates — the catch-up
+        # driver keeps 7 days of it — and reading all of it is not merely wasteful, it
+        # changes the output. Measured on 2026-08-18, one date against 7 days staged:
+        #
+        #   match rate     79.3% (gate FAILED)  ->  100.0%
+        #   segments       32,933               ->  33,918   (4.9% were being LOST)
+        #   trip_run mean  4.22                 ->  0.29
+        #
+        # The losses come from `assign_trip_runs`, which sessionises by gaps within a
+        # trip_id: seven days of the same reused id shifts every run boundary, and
+        # segments near a boundary get paired across days or dropped. The match rate
+        # falls because staged rows from before a timetable rollover cannot join the
+        # bundle this window loaded — rows the run then discards anyway, so the quality
+        # gate was failing on a statistic about data that never reaches the output.
+        #
+        # `fully_covered_service_dates` already stops neighbouring dates being WRITTEN.
+        # This stops them being READ, which is the half that was missing.
+        in_window = (F.col("captured_at") >= F.lit(start)) & (
+            F.col("captured_at") < F.lit(end)
         )
-        tu_obs = spark.read.parquet(str(staging / tu_feed)).dropDuplicates(
-            ["captured_at", "trip_id", "stop_sequence"]
+        vp_obs = (
+            spark.read.parquet(str(staging / vp_feed))
+            .where(in_window)
+            .dropDuplicates(["captured_at", "trip_id"])
+        )
+        tu_obs = (
+            spark.read.parquet(str(staging / tu_feed))
+            .where(in_window)
+            .dropDuplicates(["captured_at", "trip_id", "stop_sequence"])
         )
 
         vp_arrivals = derive_vp_arrivals(vp_obs)

@@ -54,6 +54,7 @@ from .archive import (
     snapshot_keys_by_hour,
 )
 from .config import MIN_PLAUSIBLE_EPOCH_SEC, SERVICE_TZ, EtlConfig
+from .progress import Progress
 
 logger = logging.getLogger(__name__)
 
@@ -305,8 +306,14 @@ def decode_feed(
 
     logger.info("decoding feed=%s snapshots=%d", feed, len(keys))
     rows: list[dict[str, Any]] = []
+    # This loop is the longest silent stretch in the whole ETL — ~2,880 S3 round trips
+    # per rail service day. Without progress a working run and a hung one look alike.
+    progress = Progress(logger, len(keys), f"{feed} snapshots")
     for snapshot in read_snapshots(s3, config, keys, max_workers):
         rows.extend(builder(snapshot))
+        progress.advance()
+    progress.done()
+    logger.info("  %s decoded %d observation row(s)", feed, len(rows))
 
     table = pa.Table.from_pylist(rows, schema=schema)
     destination = output_root / feed

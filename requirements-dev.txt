@@ -48,8 +48,22 @@ python-dotenv
 boto3
 
 # --------------------------------------------------------------------------
+# Modelling — stage 3
+# --------------------------------------------------------------------------
+# LightGBM is not an interchangeable choice here. `features/config.py` commits to
+# native categorical handling over target encoding (leakage risk for modest lift on
+# 785 segments), and native categorical splits are a LightGBM feature.
+lightgbm==4.7.0
+
+# Metrics only. Nothing here fits a scikit-learn estimator.
+scikit-learn==1.9.0
+
+# --------------------------------------------------------------------------
 # Tooling and notebooks
 # --------------------------------------------------------------------------
+# Writes docs/data_dictionary.xlsx.
+openpyxl==3.1.5
+
 black
 ruff
 

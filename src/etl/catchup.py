@@ -26,12 +26,14 @@ import logging
 import shutil
 import subprocess
 import sys
+import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from .archive import earliest_snapshot
 from .config import FEEDS_BY_MODE, SERVICE_TZ, EtlConfig
 from .processed import completed_service_dates, sync_partitions
+from .progress import format_duration
 from .schedule import service_day_end, service_day_start
 
 logger = logging.getLogger("catchup")
@@ -44,6 +46,12 @@ DEFAULT_LOOKBACK_DAYS = 14
 # Staged observations are disposable once a date's segments are written and synced, and
 # they accrue ~5 MB per service day.
 DEFAULT_STAGING_RETENTION_DAYS = 7
+
+# For the up-front estimate only. Measured: a rail service day is ~90s end to end,
+# dominated by the ~2,880 S3 round trips in stage A. Wrong for bus, and deliberately
+# described as "roughly" — it exists so a multi-day catch-up says how long it will sit
+# there, not to be accurate.
+TYPICAL_SECONDS_PER_DATE = 90
 
 
 def pending_service_dates(
@@ -86,7 +94,14 @@ def pending_service_dates(
     return pending
 
 
-def run_one_date(service_date: str, mode: str, staging: Path, output: Path) -> bool:
+def run_one_date(
+    service_date: str,
+    mode: str,
+    staging: Path,
+    output: Path,
+    position: int = 0,
+    of: int = 0,
+) -> bool:
     """Run the pipeline for one service date. Returns whether it succeeded.
 
     A subprocess rather than an in-process call: one date failing must not abort the
@@ -107,11 +122,23 @@ def run_one_date(service_date: str, mode: str, staging: Path, output: Path) -> b
         str(output),
         "--fail-on-quality",
     ]
-    logger.info("processing %s", service_date)
+    label = f"[{position}/{of}] " if of else ""
+    logger.info("%s=== %s ===", label, service_date)
+    started = time.monotonic()
+
     result = subprocess.run(command, check=False)
+
+    elapsed = format_duration(time.monotonic() - started)
     if result.returncode != 0:
-        logger.error("%s FAILED (exit %d)", service_date, result.returncode)
+        logger.error(
+            "%s%s FAILED after %s (exit %d)",
+            label,
+            service_date,
+            elapsed,
+            result.returncode,
+        )
         return False
+    logger.info("%s%s done in %s", label, service_date, elapsed)
     return True
 
 
@@ -211,8 +238,14 @@ def main(argv: list[str] | None = None) -> int:
 
     succeeded: list[str] = []
     failed: list[str] = []
-    for service_date in pending:
-        if run_one_date(service_date, args.mode, staging, output):
+    logger.info(
+        "processing %d date(s) — expect roughly %s",
+        len(pending),
+        format_duration(len(pending) * TYPICAL_SECONDS_PER_DATE),
+    )
+    started = time.monotonic()
+    for index, service_date in enumerate(pending, start=1):
+        if run_one_date(service_date, args.mode, staging, output, index, len(pending)):
             succeeded.append(service_date)
         else:
             failed.append(service_date)
@@ -225,7 +258,12 @@ def main(argv: list[str] | None = None) -> int:
 
     prune_staging(staging, args.mode, args.prune_staging_days, now)
 
-    logger.info("processed %d, failed %d", len(succeeded), len(failed))
+    logger.info(
+        "processed %d, failed %d in %s",
+        len(succeeded),
+        len(failed),
+        format_duration(time.monotonic() - started),
+    )
     if failed:
         logger.error("failed dates: %s", ", ".join(failed))
         return 1

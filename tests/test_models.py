@@ -1,0 +1,479 @@
+"""Tests for the modelling layer, against synthetic fixtures only.
+
+No fitting happens here. The parts worth testing are the ones that are wrong silently:
+an encoder that renumbers itself between runs, and a journey window that sums across a
+hole. Both produce entirely plausible numbers when broken.
+
+The contiguity tests exist because this bug was hit for real. `features.io` applies the
+quality filter, which drops ~2.5% of segments and punches holes into the middle of
+otherwise intact trips — 767 broken pairs on 12 service days, the largest spanning
+6,420s. Summing across one invents a journey that never ran.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+
+import pandas as pd
+import pytest
+
+from src.features.config import FeatureConfig
+from src.models.encode import UNSEEN_CODE, CategoricalEncoder
+from src.models.journey import contiguous_blocks, journey_windows
+from src.models.train import (
+    KEY_COLUMNS,
+    MEASUREMENT_COLUMNS,
+    build_matrix,
+    feature_columns,
+)
+
+START = datetime(2026, 8, 11, 12, 0, tzinfo=UTC).replace(tzinfo=None)
+
+
+def _segments(durations, *, trip="T1", run=0, first_seq=1, gap_before=None):
+    """Build a contiguous run of segments whose arrivals chain exactly.
+
+    `gap_before` inserts dead time before the run's first departure, simulating the hole
+    a filtered-out segment leaves behind.
+    """
+    rows = []
+    clock = START + (timedelta(seconds=gap_before) if gap_before else timedelta())
+    for offset, duration in enumerate(durations):
+        sequence = first_seq + offset
+        rows.append(
+            {
+                "service_date": "2026-08-11",
+                "trip_id": trip,
+                "trip_run": run,
+                "from_stop_sequence": sequence,
+                "stop_sequence": sequence + 1,
+                "actual_departure_ts": clock,
+                "actual_duration_sec": duration,
+            }
+        )
+        clock = clock + timedelta(seconds=duration)
+    return rows
+
+
+# --------------------------------------------------------------------------- blocks
+
+
+def test_clean_trip_is_one_block():
+    frame = pd.DataFrame(_segments([120, 180, 60, 240]))
+    assert contiguous_blocks(frame).nunique() == 1
+
+
+def test_hole_in_the_middle_splits_the_block():
+    """A dropped segment leaves a time gap; the run must break there."""
+    head = _segments([120, 180])
+    # Resumes at sequence 5 after 300s of unexplained time — a filtered-out segment.
+    tail = _segments([90, 150], first_seq=5, gap_before=300 + 120 + 180)
+    frame = pd.DataFrame(head + tail)
+
+    blocks = contiguous_blocks(frame)
+    assert blocks.nunique() == 2
+    assert blocks.iloc[0] == blocks.iloc[1]
+    assert blocks.iloc[2] == blocks.iloc[3]
+    assert blocks.iloc[1] != blocks.iloc[2]
+
+
+def test_separate_trips_never_share_a_block():
+    frame = pd.DataFrame(
+        _segments([120, 120], trip="T1") + _segments([120, 120], trip="T2")
+    )
+    assert contiguous_blocks(frame).nunique() == 2
+
+
+def test_repeat_run_of_one_trip_id_is_a_separate_block():
+    """trip_id is reused within a service day; ~19% of real rows are a repeat run."""
+    frame = pd.DataFrame(_segments([120, 120], run=0) + _segments([120, 120], run=1))
+    assert contiguous_blocks(frame).nunique() == 2
+
+
+def test_stop_span_greater_than_one_is_not_a_break():
+    """A stop passed between polls widens a segment; the timeline stays continuous."""
+    rows = _segments([120, 300, 120])
+    rows[1]["stop_sequence"] = rows[1]["from_stop_sequence"] + 2  # spans two stops
+    rows[2]["from_stop_sequence"] = rows[1]["stop_sequence"]
+    frame = pd.DataFrame(rows)
+    assert contiguous_blocks(frame).nunique() == 1
+
+
+# -------------------------------------------------------------------------- windows
+
+
+def test_perfect_prediction_scores_zero_error():
+    frame = pd.DataFrame(_segments([120, 180, 60, 240]))
+    frame["prediction"] = frame["actual_duration_sec"]
+
+    windows = journey_windows(frame, "prediction", lengths=(1, 2, 4))
+    assert (windows["mae_sec"] == 0).all()
+
+
+def test_journey_actuals_are_the_sum_of_their_segments():
+    frame = pd.DataFrame(_segments([120, 180, 60, 240]))
+    frame["prediction"] = 0.0
+
+    windows = journey_windows(frame, "prediction", lengths=(1, 2, 4)).set_index(
+        "segments"
+    )
+    # With a zero prediction the residual IS the actual, so bias reads back the sums.
+    assert windows.loc[4, "journeys"] == 1
+    assert windows.loc[4, "median_duration_sec"] == pytest.approx(600)
+    assert windows.loc[2, "journeys"] == 3  # (1,2) (2,3) (3,4)
+
+
+def test_windows_never_sum_across_a_block_boundary():
+    """The bug this module exists to prevent."""
+    head = _segments([120, 120])
+    tail = _segments([120, 120], first_seq=5, gap_before=9999)
+    frame = pd.DataFrame(head + tail)
+    frame["prediction"] = 0.0
+
+    # Four segments, but never four contiguous ones — no journey of length 4 exists.
+    windows = journey_windows(frame, "prediction", lengths=(2, 3, 4)).set_index(
+        "segments"
+    )
+    assert windows.loc[2, "journeys"] == 2  # one per block, not three
+    assert 3 not in windows.index or windows.loc[3, "journeys"] == 0
+    assert 4 not in windows.index
+
+
+def test_bias_sign_means_the_model_ran_short():
+    """residual = actual - predicted, matching features.baselines._score."""
+    frame = pd.DataFrame(_segments([120, 120]))
+    frame["prediction"] = 100.0
+
+    windows = journey_windows(frame, "prediction", lengths=(1,)).set_index("segments")
+    assert windows.loc[1, "bias_sec"] == pytest.approx(20.0)
+
+
+# -------------------------------------------------------------------------- encoder
+
+
+def _categorical_frame():
+    return pd.DataFrame(
+        {
+            "route_id": ["RED", "BLUE", "RED"],
+            "direction_id": [0, 1, 0],
+            "segment_id": ["A>B", "B>C", "A>B"],
+            "from_station": ["A01", "B02", "A01"],
+            "to_station": ["A02", "B03", "A02"],
+        }
+    )
+
+
+def test_encoder_round_trips_known_categories():
+    frame = _categorical_frame()
+    encoder = CategoricalEncoder.fit(frame)
+    encoded = encoder.transform(frame)
+
+    assert (encoded["route_id"] >= 0).all()
+    # Same input value must always get the same code.
+    assert encoded["route_id"].iloc[0] == encoded["route_id"].iloc[2]
+    assert encoded["route_id"].iloc[0] != encoded["route_id"].iloc[1]
+
+
+def test_unseen_category_becomes_missing_not_a_crash():
+    """89 segments appear in validation but never training on the real 12 days."""
+    encoder = CategoricalEncoder.fit(_categorical_frame())
+    unseen = _categorical_frame()
+    unseen.loc[0, "segment_id"] = "NEVER>SEEN"
+
+    encoded = encoder.transform(unseen)
+    assert encoded.loc[0, "segment_id"] == UNSEEN_CODE
+    assert UNSEEN_CODE < 0, "LightGBM only reads negatives as missing"
+
+
+def test_unseen_rate_is_reported():
+    encoder = CategoricalEncoder.fit(_categorical_frame())
+    frame = _categorical_frame()
+    frame.loc[0, "segment_id"] = "NEVER>SEEN"
+    assert encoder.unseen_rate(frame)["segment_id"] == pytest.approx(100 / 3)
+
+
+def test_codes_do_not_depend_on_which_rows_are_present():
+    """The trap pd.Categorical.codes falls into: a missing category renumbers others."""
+    full = _categorical_frame()
+    encoder = CategoricalEncoder.fit(full)
+
+    subset = full[full["route_id"] == "BLUE"]
+    assert (
+        encoder.transform(subset)["route_id"].iloc[0]
+        == encoder.transform(full)["route_id"].iloc[1]
+    )
+
+
+def test_encoder_survives_save_and_load(tmp_path):
+    encoder = CategoricalEncoder.fit(_categorical_frame())
+    path = tmp_path / "encoder.json"
+    encoder.save(path)
+
+    reloaded = CategoricalEncoder.load(path)
+    assert reloaded.mapping == encoder.mapping
+    pd.testing.assert_frame_equal(
+        reloaded.transform(_categorical_frame()),
+        encoder.transform(_categorical_frame()),
+    )
+
+
+# ------------------------------------------------------------------- feature matrix
+
+
+def _feature_frame():
+    frame = pd.DataFrame(_segments([120, 180]))
+    frame["arrival_bracket_sec"] = 60
+    frame["arrival_source"] = "vehicle_position"
+    frame["delay_sec"] = 0
+    frame["actual_arrival_ts"] = frame["actual_departure_ts"]
+    frame["observed_at_utc"] = frame["actual_departure_ts"]
+    frame["from_stop_id"] = "PF_A01_C"
+    frame["to_stop_id"] = "PF_A02_C"
+    frame["local_hour"] = 8
+    frame["scheduled_duration_sec"] = 120.0
+    frame["route_id"] = "RED"
+    frame["segment_id"] = "A>B"
+    return frame
+
+
+def test_measurement_columns_are_not_features():
+    """They describe how the LABEL was measured — only knowable after the fact."""
+    columns = feature_columns(_feature_frame())
+    for column in MEASUREMENT_COLUMNS:
+        assert column not in columns
+
+
+def test_keys_and_label_side_columns_are_not_features():
+    columns = feature_columns(_feature_frame())
+    for column in (
+        *KEY_COLUMNS,
+        "actual_duration_sec",
+        "delay_sec",
+        "actual_arrival_ts",
+    ):
+        assert column not in columns
+
+
+def test_real_features_survive_selection():
+    columns = feature_columns(_feature_frame())
+    for column in ("local_hour", "scheduled_duration_sec", "route_id", "segment_id"):
+        assert column in columns
+
+
+def test_matrix_preserves_the_persisted_column_order():
+    frame = _feature_frame()
+    encoder = CategoricalEncoder.fit(frame, FeatureConfig())
+    columns = feature_columns(frame)
+
+    matrix = build_matrix(frame, encoder, columns)
+    assert list(matrix.columns) == columns
+
+
+def test_matrix_refuses_a_frame_missing_a_feature():
+    """Serving with a column silently absent would score against a shifted matrix."""
+    frame = _feature_frame()
+    encoder = CategoricalEncoder.fit(frame, FeatureConfig())
+    columns = feature_columns(frame)
+
+    with pytest.raises(ValueError, match="absent from the frame"):
+        build_matrix(frame.drop(columns=["local_hour"]), encoder, columns)
+
+
+def test_undeclared_string_feature_is_still_encoded():
+    """`fare_period` is a string and is NOT in FeatureConfig.categorical_columns.
+
+    Unencoded it reaches LightGBM as a raw string, which raises. Caught by the smoke
+    check on real data rather than by any fixture, so it is pinned here.
+    """
+    from src.models.train import categorical_columns
+
+    frame = _feature_frame()
+    frame["fare_period"] = "weekday_standard"
+    columns = feature_columns(frame)
+
+    categoricals = categorical_columns(frame, columns)
+    assert "fare_period" in categoricals
+
+    encoder = CategoricalEncoder.fit(frame, extra_columns=categoricals)
+    matrix = build_matrix(frame, encoder, columns)
+    assert matrix["fare_period"].dtype.kind in "i"
+
+
+def test_no_feature_reaches_the_model_as_a_string():
+    """The general form of the bug above — dtype-driven, so new columns are covered."""
+    from src.models.train import categorical_columns
+
+    frame = _feature_frame()
+    frame["fare_period"] = "weekday_standard"
+    frame["some_future_string_feature"] = "x"
+    columns = feature_columns(frame)
+
+    encoder = CategoricalEncoder.fit(
+        frame, extra_columns=categorical_columns(frame, columns)
+    )
+    matrix = build_matrix(frame, encoder, columns)
+    assert all(matrix[c].dtype.kind in "ifb" for c in matrix.columns)
+
+
+# ---------------------------------------------------------------- calibration
+
+
+def test_calibration_recovers_a_known_injected_bias():
+    """The whole point: find the constant the model is off by."""
+    import numpy as np
+
+    from src.models.calibrate import BiasCalibration
+
+    rng = np.random.default_rng(0)
+    actual = pd.Series(rng.normal(120, 40, 5000))
+    predicted = actual - 6.04  # model runs short, as the real one did
+
+    calibration = BiasCalibration.fit(actual, predicted)
+    assert calibration.offset_sec == pytest.approx(6.04, abs=0.01)
+    assert np.mean(actual - calibration.apply(predicted)) == pytest.approx(0, abs=0.01)
+
+
+def test_calibration_of_unbiased_predictions_is_a_no_op():
+
+    from src.models.calibrate import BiasCalibration
+
+    actual = pd.Series([100.0, 120.0, 140.0])
+    predicted = pd.Series([100.0, 120.0, 140.0])
+    assert BiasCalibration.fit(actual, predicted).offset_sec == pytest.approx(0.0)
+
+
+def test_calibration_is_additive_and_order_preserving():
+    """A constant shift must not reorder predictions — only translate them."""
+    import numpy as np
+
+    from src.models.calibrate import BiasCalibration
+
+    predicted = pd.Series([60.0, 300.0, 120.0])
+    shifted = BiasCalibration(offset_sec=7.5).apply(predicted)
+    assert np.allclose(shifted - predicted, 7.5)
+    assert list(np.argsort(shifted)) == list(np.argsort(predicted))
+
+
+def test_calibration_survives_save_and_load(tmp_path):
+    from src.models.calibrate import BiasCalibration
+
+    path = tmp_path / "calibration.json"
+    BiasCalibration(offset_sec=6.04).save(path)
+    assert BiasCalibration.load(path).offset_sec == pytest.approx(6.04)
+
+
+def test_bias_accumulates_linearly_over_a_journey():
+    """Why a per-segment offset is the right level: it fixes every length at once."""
+    from src.models.calibrate import BiasCalibration
+    from src.models.journey import journey_windows
+
+    frame = pd.DataFrame(_segments([120, 120, 120, 120]))
+    frame["prediction"] = frame["actual_duration_sec"] - 6.0  # 6s short per segment
+
+    raw = journey_windows(frame, "prediction", lengths=(1, 4)).set_index("segments")
+    assert raw.loc[1, "bias_sec"] == pytest.approx(6.0)
+    assert raw.loc[4, "bias_sec"] == pytest.approx(24.0)  # 4x, linear — the problem
+
+    frame["prediction_calibrated"] = BiasCalibration(offset_sec=6.0).apply(
+        frame["prediction"]
+    )
+    fixed = journey_windows(frame, "prediction_calibrated", lengths=(1, 4)).set_index(
+        "segments"
+    )
+    assert fixed.loc[1, "bias_sec"] == pytest.approx(0.0)
+    assert fixed.loc[4, "bias_sec"] == pytest.approx(0.0)  # fixed at every length
+
+
+# ----------------------------------------------------------------- artifacts
+
+
+def test_runs_are_immutable_across_retrains(tmp_path):
+    """Retraining must never overwrite a previous run — that is the whole point."""
+    from datetime import UTC, datetime
+
+    from src.models.artifacts import new_run_dir
+
+    when = datetime(2026, 8, 20, 19, 0, 0, tzinfo=UTC)
+    first = new_run_dir(tmp_path, when)
+    (first / "model.txt").write_text("first")
+
+    # Same clock second: must still land somewhere new, not merge into the first.
+    second = new_run_dir(tmp_path, when)
+    assert second != first
+    assert (first / "model.txt").read_text() == "first"
+
+
+def test_latest_points_at_the_newest_run(tmp_path):
+    from datetime import UTC, datetime
+
+    from src.models.artifacts import mark_latest, new_run_dir, resolve_run
+
+    old = new_run_dir(tmp_path, datetime(2026, 8, 20, 10, 0, tzinfo=UTC))
+    new = new_run_dir(tmp_path, datetime(2026, 8, 20, 11, 0, tzinfo=UTC))
+    mark_latest(tmp_path, new)
+
+    assert resolve_run(tmp_path) == new.resolve()
+    assert resolve_run(tmp_path, old.name) == old
+    # A plain-JSON pointer too, for anything that will not follow a symlink.
+    assert json.loads((tmp_path / "latest.json").read_text())["run"] == new.name
+
+
+def test_resolve_run_fails_loudly_when_there_is_nothing(tmp_path):
+    from src.models.artifacts import resolve_run
+
+    with pytest.raises(FileNotFoundError, match="train a model first"):
+        resolve_run(tmp_path)
+
+
+def test_manifest_records_provenance_and_checksums(tmp_path):
+    from datetime import UTC, datetime
+
+    from src.models.artifacts import new_run_dir, write_manifest
+
+    run = new_run_dir(tmp_path, datetime(2026, 8, 20, 12, 0, tzinfo=UTC))
+    (run / "model.txt").write_text("tree ensemble")
+
+    write_manifest(
+        run,
+        model_name="segment_duration",
+        target="actual_duration_sec",
+        trustworthy=False,
+        training_data={"service_dates": ["2026-08-07"]},
+        params={"objective": "regression_l1"},
+        best_iteration=709,
+        feature_columns=["local_hour", "route_id"],
+        categorical_columns=["route_id"],
+        headline_metrics={"mae": 22.6},
+    )
+    manifest = json.loads((run / "manifest.json").read_text())
+
+    # A registry must never present a provisional score as validated.
+    assert manifest["trustworthy"] is False
+    assert manifest["feature_schema"]["n_features"] == 2
+    assert "model.txt" in manifest["artifacts"]
+    assert len(manifest["artifacts"]["model.txt"]) == 64  # sha256 hex
+    assert "lightgbm" in manifest["environment"]
+
+
+def test_package_flattens_for_sagemaker(tmp_path):
+    """SageMaker extracts into /opt/ml/model, so members sit at the archive root."""
+    import tarfile
+    from datetime import UTC, datetime
+
+    from src.models.artifacts import new_run_dir, package
+
+    run = new_run_dir(tmp_path, datetime(2026, 8, 20, 13, 0, tzinfo=UTC))
+    for name in ("model.txt", "encoder.json", "feature_columns.json", "manifest.json"):
+        (run / name).write_text("{}")
+    (run / "plots" / "learning_curve.png").write_bytes(b"not really a png")
+    (run / "validation_predictions.parquet").write_bytes(b"parquet")
+
+    archive = package(run)
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+
+    assert "model.txt" in names
+    assert not any("/" in n for n in names), "nested paths break the serving handler"
+    # Evaluation evidence must not bloat every container pull.
+    assert not any(n.endswith(".png") or n.endswith(".parquet") for n in names)
