@@ -93,6 +93,20 @@ PARAMS: dict = {
     "seed": 17,
     "verbosity": -1,
 }
+# A second model at a high quantile, for "when will I definitely arrive?".
+#
+# The median model is systematically optimistic on long journeys — +4.69s of bias at one
+# segment rising to +135.93s at 28 — because `regression_l1` targets the conditional
+# median and journey duration is right-skewed. De-biasing it is the wrong fix: zeroing
+# the mean residual was measured to make MAE WORSE at every length (n=1: 23.71s ->
+# 25.35s), since L1 already sits where MAE wants it.
+#
+# The real problem is that one point estimate cannot answer two questions. "How long
+# will this take?" wants the median. "When should I budget to arrive?" wants an upper
+# quantile. Training both and serving both is honest about the skew rather than
+# averaging it away.
+QUANTILE_ALPHA = 0.8
+
 NUM_BOOST_ROUND = 6000
 EARLY_STOPPING_ROUNDS = 100
 
@@ -125,7 +139,12 @@ def build_matrix(
     return encoded[columns]
 
 
-def fit(train_frame: pd.DataFrame, validation_frame: pd.DataFrame):
+def fit(
+    train_frame: pd.DataFrame,
+    validation_frame: pd.DataFrame,
+    quantile: float | None = None,
+):
+    """Fit the journey model. `quantile` swaps L1 for pinball loss at that level."""
     import lightgbm as lgb
 
     columns = feature_columns(train_frame)
@@ -145,6 +164,15 @@ def fit(train_frame: pd.DataFrame, validation_frame: pd.DataFrame):
         reference=train_set,
         categorical_feature=categoricals,
     )
+    params = dict(PARAMS)
+    if quantile is not None:
+        # Pinball loss. `metric` must move too, or early stopping would select on L1
+        # while the objective optimises something else — the model would stop at the
+        # wrong iteration and nothing would say so.
+        params["objective"] = "quantile"
+        params["alpha"] = quantile
+        params["metric"] = "quantile"
+
     logger.info(
         "fitting on %d rows x %d features (%d categorical)",
         len(x_train),
@@ -152,7 +180,7 @@ def fit(train_frame: pd.DataFrame, validation_frame: pd.DataFrame):
         len(categoricals),
     )
     booster = lgb.train(
-        PARAMS,
+        params,
         train_set,
         num_boost_round=NUM_BOOST_ROUND,
         # Train is scored too, purely so the learning curve has both lines — without
@@ -194,7 +222,13 @@ def by_length(frame: pd.DataFrame, columns: dict[str, str]) -> pd.DataFrame:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--journeys", default=None)
-    parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--quantile",
+        type=float,
+        default=None,
+        help=f"upper-quantile model instead of the median, e.g. {QUANTILE_ALPHA}",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -217,7 +251,9 @@ def main(argv: list[str] | None = None) -> int:
     if not report.is_trustworthy:
         logger.warning("SPLIT NOT TRUSTWORTHY — every metric below is provisional")
 
-    booster, encoder, columns, history = fit(train_frame, validation_frame)
+    booster, encoder, columns, history = fit(
+        train_frame, validation_frame, quantile=args.quantile
+    )
 
     for part in (train_frame, validation_frame):
         part["prediction"] = booster.predict(
@@ -228,7 +264,14 @@ def main(argv: list[str] | None = None) -> int:
     # docstring for the measurements showing correction makes MAE worse at every length.
     table = by_length(validation_frame, {"journey_model": "prediction"})
 
-    root = Path(args.output)
+    # A quantile model is a different artifact answering a different question, so it
+    # gets its own run tree. Sharing one would make `latest` ambiguous.
+    default_output = (
+        DEFAULT_OUTPUT
+        if args.quantile is None
+        else f"{DEFAULT_OUTPUT}_p{int(args.quantile * 100)}"
+    )
+    root = Path(args.output or default_output)
     run = new_run_dir(root)
     booster.save_model(str(run / "model.txt"), num_iteration=booster.best_iteration)
     encoder.save(run / "encoder.json")
@@ -272,7 +315,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     write_manifest(
         run,
-        model_name="journey_duration",
+        model_name=(
+            "journey_duration"
+            if args.quantile is None
+            else f"journey_duration_p{int(args.quantile * 100)}"
+        ),
         target=JOURNEY_TARGET,
         trustworthy=report.is_trustworthy,
         training_data={
@@ -288,6 +335,23 @@ def main(argv: list[str] | None = None) -> int:
         categorical_columns=categorical_columns(train_frame, columns),
         headline_metrics={
             "by_length": table.to_dict(orient="records"),
+            # For a quantile model this is the number that matters: the share
+            # of journeys that actually finished within the estimate. Measured, not
+            # assumed — a p80 trained across all lengths pooled achieves 80.2% at one
+            # segment and 62.3% at 28, so serving reports what it achieved for that
+            # length rather than repeating the nominal alpha.
+            "coverage_pct": (
+                {}
+                if args.quantile is None
+                else {
+                    str(int(n)): round(
+                        100
+                        * float((part[JOURNEY_TARGET] <= part["prediction"]).mean()),
+                        1,
+                    )
+                    for n, part in validation_frame.groupby("n_segments")
+                }
+            ),
             # How many TRAINING journeys existed at each length. Serving warns when a
             # requested length is thinly supported — a length can be "trained on" and
             # still have too few examples to answer from, which a max-length cutoff
@@ -300,7 +364,12 @@ def main(argv: list[str] | None = None) -> int:
                 .items()
             },
         },
-        notes="Journey model. Predicts arrival(B)-arrival(A) directly; nothing summed.",
+        notes=(
+            "Journey model, median (regression_l1)."
+            if args.quantile is None
+            else f"Journey model, {args.quantile:.0%} quantile: an 'arrive by' "
+            "estimate, not a typical duration. Higher MAE by construction."
+        ),
     )
     mark_latest(root, run)
 

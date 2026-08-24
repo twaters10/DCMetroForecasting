@@ -64,6 +64,11 @@ scikit-learn==1.9.0
 # Writes docs/data_dictionary.xlsx.
 openpyxl==3.1.5
 
+# The local UI over the deployed endpoint. Local rather than hosted because a SageMaker
+# endpoint needs SigV4 and a static page cannot sign a request; boto3 does it from here,
+# which keeps "the only managed compute is the collector Lambda and the endpoint" true.
+streamlit==1.62.0
+
 black
 ruff
 

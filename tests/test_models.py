@@ -774,3 +774,18 @@ def test_thinly_supported_length_is_still_flagged():
 def test_missing_support_map_reports_unknown():
     """Manifests predating per-length counts have nothing to reason from."""
     assert _training_support(8, {}) is None
+
+
+def test_coverage_interpolates_like_support():
+    """The quantile model's achieved coverage is per-length and also discrete.
+
+    Reported coverage must be the WEAKER neighbour: claiming 78.7% for a 26-segment
+    journey when the neighbouring length achieves 62.3% would overstate it
+    exactly where it is weakest.
+    """
+    from src.serving.inference import _bracketed
+
+    coverage = {"1": 80.2, "24": 64.2, "28": 62.3}
+    assert _bracketed(26, coverage) == 62.3
+    assert _bracketed(24, coverage) == 64.2
+    assert _bracketed(40, coverage) is None

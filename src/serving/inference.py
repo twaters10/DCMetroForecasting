@@ -134,6 +134,21 @@ class Artifacts:
         self._live_fetched_at: float = 0.0
         self.bucket = os.environ.get("S3_BUCKET", "")
         self.run_id = json.loads((directory / "manifest.json").read_text())["run_id"]
+
+        # The "arrive by" companion. Same encoder and feature columns — both are trained
+        # on the same journey table — so only the booster differs. Absent when no
+        # quantile model exists, in which case the response omits it rather than
+        # inventing one.
+        quantile_path = directory / "model_p80.txt"
+        self.quantile_booster = (
+            lgb.Booster(model_file=str(quantile_path))
+            if quantile_path.exists()
+            else None
+        )
+        coverage_path = directory / "coverage_p80.json"
+        self.quantile_coverage: dict[str, float] = (
+            json.loads(coverage_path.read_text()) if coverage_path.exists() else {}
+        )
         manifest = json.loads((directory / "manifest.json").read_text())
         self.trustworthy = manifest["trustworthy"]
         # {"4": 78894, "17": 93870, "32": 118} — how many training journeys existed at
@@ -234,27 +249,35 @@ def _calendar_features(when: pd.Timestamp) -> dict:
     }
 
 
-def _training_support(segments: int, support: dict[str, int]) -> int | None:
-    """How much training evidence backs a journey of this length.
+def _bracketed(segments: int, table: dict[str, float]) -> float | None:
+    """Look a per-length value up, interpolating between the lengths that were trained.
 
-    Training covers a **discrete set** of lengths (1, 2, 3, 4, 6, 8, ... 32), but a real
-    request can be any length. An exact-key lookup therefore reported "no training
-    journeys" for most journeys — including 26 segments, which sits between n=24 (18,182
-    journeys) and n=28 (6,359) and predicts well precisely because it is bracketed.
+    Training covers a **discrete set** of lengths (1, 2, 3, 4, 6, 8, ... 32) while a
+    request can be any length. An exact-key lookup therefore missed most journeys: it
+    reported "no training journeys" for 26 segments, which sits between n=24 and n=28
+    and predicts well precisely because it is bracketed.
 
-    So support is the WEAKER of the two nearest trained lengths either side. Beyond the
-    largest trained length there is nothing to interpolate between, and `None` says so —
-    that is genuine extrapolation, and the difference matters: interpolating between two
-    well-populated lengths is sound, guessing past the end is not.
+    Returns the **weaker** of the two neighbours, which is the conservative reading for
+    both things this is used for: training support (less evidence) and quantile coverage
+    (less of the distribution captured).
+
+    `None` means the length falls outside the trained range entirely. That is genuine
+    extrapolation and a different claim from "interpolated between two known points".
     """
-    if not support:
+    if not table:
         return None
-    lengths = sorted(int(k) for k in support)
+    lengths = sorted(int(k) for k in table)
     if segments > lengths[-1] or segments < lengths[0]:
         return None
     below = max(n for n in lengths if n <= segments)
     above = min(n for n in lengths if n >= segments)
-    return min(int(support[str(below)]), int(support[str(above)]))
+    return min(float(table[str(below)]), float(table[str(above)]))
+
+
+def _training_support(segments: int, support: dict[str, int]) -> int | None:
+    """How much training evidence backs a journey of this length."""
+    value = _bracketed(segments, support)
+    return None if value is None else int(value)
 
 
 def _recent_conditions(
@@ -365,7 +388,8 @@ def _predict(payload: dict, artifacts: Artifacts) -> dict:
     if missing:
         raise ValueError(f"handler failed to produce required feature(s): {missing}")
 
-    predicted = float(artifacts.booster.predict(frame[artifacts.columns])[0])
+    matrix = frame[artifacts.columns]
+    predicted = float(artifacts.booster.predict(matrix)[0])
 
     warnings: list[str] = []
     segments = journey["n_segments"]
@@ -387,8 +411,28 @@ def _predict(payload: dict, artifacts: Artifacts) -> dict:
             "recent-conditions features are null, so this leans on the schedule"
         )
 
+    arrive_by: dict = {}
+    if artifacts.quantile_booster is not None:
+        upper = float(artifacts.quantile_booster.predict(matrix)[0])
+        # Report the coverage this model ACHIEVED at this length, not the nominal 80%.
+        # Measured: 80.2% at one segment falling to 62.3% at 28, because a single
+        # quantile fitted across pooled lengths under-covers the long tail. Quoting the
+        # nominal figure would overstate the guarantee exactly where it is weakest.
+        achieved = _bracketed(segments, artifacts.quantile_coverage)
+        arrive_by = {
+            "arrive_by_sec": round(upper, 1),
+            "arrive_by_min": round(upper / 60, 2),
+            "arrive_by_coverage_pct": achieved,
+        }
+        if achieved is not None and achieved < 70:
+            warnings.append(
+                f"the arrive-by estimate covers only {achieved:.0f}% of journeys at "
+                f"{segments} segments, not the nominal 80%"
+            )
+
     return {
         "predicted_sec": round(predicted, 1),
+        **arrive_by,
         "predicted_min": round(predicted / 60, 2),
         "scheduled_sec": journey["scheduled_total_sec"],
         "n_segments": journey["n_segments"],

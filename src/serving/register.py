@@ -42,6 +42,12 @@ logger = logging.getLogger("serving.register")
 
 MODEL_PACKAGE_GROUP = "metro-pulse-journey-duration"
 MODEL_ROOT = "data/models/journey_duration"
+
+# The "arrive by" companion, shipped in the same tarball. Two models answering two
+# questions from one artifact: the median for "how long will this take", the upper
+# quantile for "when should I budget to arrive". Optional — if never trained, the
+# endpoint simply omits `arrive_by_sec`.
+QUANTILE_MODEL_ROOT = "data/models/journey_duration_p80"
 SERVING_INPUTS = "data/processed/serving"
 LOOKUP = "data/processed/features/recent_conditions_lookup.parquet"
 REGION = "us-east-1"
@@ -154,6 +160,26 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     serving = staged_serving_dir(run / "serving_inputs")
+
+    # The quantile model rides along as `model_p80.txt` plus its coverage table. It uses
+    # the SAME encoder and feature columns as the median model — both are trained on the
+    # same journey table — so only the booster and the coverage need shipping.
+    quantile_root = Path(QUANTILE_MODEL_ROOT)
+    if (quantile_root / "latest").exists():
+        quantile_run = resolve_run(quantile_root)
+        quantile_manifest = json.loads((quantile_run / "manifest.json").read_text())
+        shutil.copy(quantile_run / "model.txt", serving / "model_p80.txt")
+        (serving / "coverage_p80.json").write_text(
+            json.dumps(
+                quantile_manifest["headline_metrics"].get("coverage_pct", {}), indent=1
+            )
+        )
+        logger.info("bundled quantile model from run %s", quantile_run.name)
+    else:
+        logger.warning(
+            "no quantile model at %s — the endpoint will omit arrive_by_sec",
+            quantile_root,
+        )
     code_dir = Path(__file__).parent
     archive = package(
         run,
