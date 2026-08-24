@@ -43,6 +43,15 @@ logger = logging.getLogger("collector.recent_conditions")
 LOOKBACK_MINUTES = 90
 SERVING_PREFIX = "models/serving/"
 OUTPUT_KEY = f"{SERVING_PREFIX}recent_conditions_live.csv"
+
+# Every write is ALSO archived under a timestamped key. The live object is overwritten
+# every five minutes, so without this a past prediction can never be faithfully
+# reconstructed — `recent_deviation` depends on conditions at a moment, and scoring a
+# historical prediction against conditions it did not have would flatter the model.
+#
+# ~12 KB per write, ~3.5 MB/day, and it CANNOT be backfilled: every interval this is not
+# running is an interval of monitoring history that will never exist.
+ARCHIVE_PREFIX = "models/serving/history/recent_conditions/"
 MEDIANS_KEY = f"{SERVING_PREFIX}segment_hour_medians.csv"
 SCHEDULED_KEY = f"{SERVING_PREFIX}segment_scheduled.csv"
 
@@ -206,17 +215,32 @@ def build_recent_conditions(config: Any, s3: Any) -> dict[str, Any]:
 
     buffer = io.StringIO()
     lookup.to_csv(buffer, index=False)
+    payload = buffer.getvalue().encode()
     s3.put_object(
         Bucket=config.s3_bucket,
         Key=OUTPUT_KEY,
-        Body=buffer.getvalue().encode(),
+        Body=payload,
         ContentType="text/csv",
     )
-    logger.info("wrote %d segment(s) to %s", len(lookup), OUTPUT_KEY)
+
+    # Hive-partitioned by date so a monitoring job can read one service day without
+    # listing the whole history.
+    now = datetime.now(UTC)
+    archive_key = f"{ARCHIVE_PREFIX}date={now:%Y-%m-%d}/{now:%Y%m%dT%H%M%S}Z.csv"
+    s3.put_object(
+        Bucket=config.s3_bucket,
+        Key=archive_key,
+        Body=payload,
+        ContentType="text/csv",
+    )
+    logger.info(
+        "wrote %d segment(s) to %s and %s", len(lookup), OUTPUT_KEY, archive_key
+    )
     return {
         "ok": True,
         "segments": int(len(lookup)),
         "snapshots": len(keys),
         "traversals": int(len(segments)),
         "key": OUTPUT_KEY,
+        "archive_key": archive_key,
     }
