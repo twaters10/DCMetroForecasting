@@ -286,7 +286,20 @@ def main(argv: list[str] | None = None) -> int:
         best_iteration=booster.best_iteration,
         feature_columns=columns,
         categorical_columns=categorical_columns(train_frame, columns),
-        headline_metrics={"by_length": table.to_dict(orient="records")},
+        headline_metrics={
+            "by_length": table.to_dict(orient="records"),
+            # How many TRAINING journeys existed at each length. Serving warns when a
+            # requested length is thinly supported — a length can be "trained on" and
+            # still have too few examples to answer from, which a max-length cutoff
+            # cannot express.
+            "training_support": {
+                str(int(k)): int(v)
+                for k, v in train_frame["n_segments"]
+                .value_counts()
+                .sort_index()
+                .items()
+            },
+        },
         notes="Journey model. Predicts arrival(B)-arrival(A) directly; nothing summed.",
     )
     mark_latest(root, run)

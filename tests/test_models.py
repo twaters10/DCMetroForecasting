@@ -731,3 +731,46 @@ def test_repackaging_different_contents_yields_a_different_key(tmp_path):
 
     assert first != second, "same run, different bytes, must not collide"
     assert run.name in first and run.name in second, "run id stays traceable in the key"
+
+
+# ------------------------------------------------- serving: thin-support warnings
+
+from src.serving.inference import (  # noqa: E402 - grouped with its own tests
+    MIN_TRAINING_SUPPORT,
+    _training_support,
+)
+
+# Real counts from the 17-date run, so the numbers in these assertions mean something.
+SUPPORT = {"1": 430821, "4": 342507, "17": 78664, "24": 18182, "28": 6359, "32": 98}
+
+
+def test_support_is_exact_when_the_length_was_trained():
+    assert _training_support(4, SUPPORT) == 342507
+
+
+def test_support_interpolates_between_trained_lengths():
+    """26 segments is not a trained length but sits between 24 and 28.
+
+    REGRESSION: an exact-key lookup reported "no training journeys of 26 segments" for a
+    journey the model predicts well — Shady Grove to Glenmont, 61.35 min against a
+    62-minute schedule. Training covers a discrete set of lengths; requests are
+    continuous, so most real journeys fell through the exact lookup and warned wrongly.
+    """
+    # The weaker of the two neighbours, not the nearer one: 28 has less evidence.
+    assert _training_support(26, SUPPORT) == 6359
+
+
+def test_beyond_the_largest_trained_length_is_genuine_extrapolation():
+    """Nothing to interpolate between past the end — that is a different claim."""
+    assert _training_support(40, SUPPORT) is None
+
+
+def test_thinly_supported_length_is_still_flagged():
+    """n=32 has 98 training journeys. Trained on is not the same as supported."""
+    assert _training_support(32, SUPPORT) == 98
+    assert _training_support(32, SUPPORT) < MIN_TRAINING_SUPPORT
+
+
+def test_missing_support_map_reports_unknown():
+    """Manifests predating per-length counts have nothing to reason from."""
+    assert _training_support(8, {}) is None

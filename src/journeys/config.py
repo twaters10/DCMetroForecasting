@@ -31,10 +31,34 @@ JOURNEY_KEY: Final[tuple[str, ...]] = (
 )
 
 # Enumerating every window is b(b+1)/2 per block — 4.1M rows, most of them
-# near-duplicate lengths. These ten span 1 segment (~2 min) to 17 (~36 min) and
-# match the lengths `models.evaluate` already reports, so the journey model and the
-# summed segment model are scored on exactly the same horizons.
-DEFAULT_LENGTHS: Final[tuple[int, ...]] = (1, 2, 3, 4, 6, 8, 10, 12, 15, 17)
+# near-duplicate lengths. These span 1 segment (~2 min) to 32, the longest unbroken run
+# the network actually produces.
+#
+# Previously capped at 17, which left **35.3% of runs** longer than anything trained on:
+# the median run is 13 segments but p90 is 25 and p99 is 31, so Shady Grove to Glenmont
+# at 26 was in the p90 band, not an outlier. Extending to 32 costs only ~3% more rows.
+#
+# Coverage is NOT uniform across these. Measured on 16 service days: n=20 has 51,807
+# journeys, n=24 has 21,773, n=28 has 7,664 — and n=32 has **118**. The long tail is
+# included so the model sees it at all, but 118 examples is not a basis for a confident
+# answer, which is why serving warns on THIN SUPPORT rather than on a single length
+# cutoff. `journeys/train.py` records the per-length counts into the manifest.
+DEFAULT_LENGTHS: Final[tuple[int, ...]] = (
+    1,
+    2,
+    3,
+    4,
+    6,
+    8,
+    10,
+    12,
+    15,
+    17,
+    20,
+    24,
+    28,
+    32,
+)
 
 
 @dataclass(frozen=True, slots=True)

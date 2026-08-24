@@ -62,15 +62,19 @@ logger = logging.getLogger("serving.inference")
 
 ROLLING_MAX_AGE_SEC = 3600
 
-# The journey table is built for lengths up to 17 segments (journeys.config.
-# DEFAULT_LENGTHS), but the network runs longer: Shady Grove to Glenmont is 26. Asked to
-# extrapolate, the model predicted 2,471s against a 3,720s schedule — a 21-minute
-# underestimate claiming the train beats the timetable by a third.
+# Below this many training examples at a given journey length, a prediction is answered
+# from too little evidence to be trusted. Read against the per-length counts the model
+# records in its own manifest, rather than a hardcoded length cutoff.
 #
-# Extrapolated answers are still returned, because refusing a legitimate journey is its
-# own failure, but they are flagged on the response so a caller cannot mistake one for a
-# supported prediction. The real fix is to train on longer windows.
-MAX_TRAINED_SEGMENTS = 17
+# A cutoff cannot express what the data actually looks like. Training covers lengths up
+# to 32, but coverage is wildly uneven: n=20 has 51,807 journeys, n=24 has 21,773,
+# n=28 has 7,664 — and n=32 has 118. "Trained on" and "supported" are not the same
+# claim, and a single MAX_TRAINED_SEGMENTS would let the model answer at 32 as
+# confidently as at 4.
+MIN_TRAINING_SUPPORT = 1000
+
+# Fallback only, for a manifest written before per-length support was recorded.
+FALLBACK_MAX_SEGMENTS = 17
 
 # Where the collector Lambda writes the live recent-conditions table, refreshed every
 # few minutes. Read per request rather than baked into model.tar.gz: the bundled copy is
@@ -130,9 +134,13 @@ class Artifacts:
         self._live_fetched_at: float = 0.0
         self.bucket = os.environ.get("S3_BUCKET", "")
         self.run_id = json.loads((directory / "manifest.json").read_text())["run_id"]
-        self.trustworthy = json.loads((directory / "manifest.json").read_text())[
-            "trustworthy"
-        ]
+        manifest = json.loads((directory / "manifest.json").read_text())
+        self.trustworthy = manifest["trustworthy"]
+        # {"4": 78894, "17": 93870, "32": 118} — how many training journeys existed at
+        # each length. Absent on manifests predating this, hence the fallback.
+        self.training_support: dict[str, int] = (
+            manifest.get("headline_metrics", {}).get("training_support") or {}
+        )
         logger.info(
             "loaded run %s: %d features, %d OD pairs, %d lookup rows",
             self.run_id,
@@ -224,6 +232,29 @@ def _calendar_features(when: pd.Timestamp) -> dict:
         "is_service_weekday": int(not is_weekend),
         "fare_period": fare,
     }
+
+
+def _training_support(segments: int, support: dict[str, int]) -> int | None:
+    """How much training evidence backs a journey of this length.
+
+    Training covers a **discrete set** of lengths (1, 2, 3, 4, 6, 8, ... 32), but a real
+    request can be any length. An exact-key lookup therefore reported "no training
+    journeys" for most journeys — including 26 segments, which sits between n=24 (18,182
+    journeys) and n=28 (6,359) and predicts well precisely because it is bracketed.
+
+    So support is the WEAKER of the two nearest trained lengths either side. Beyond the
+    largest trained length there is nothing to interpolate between, and `None` says so —
+    that is genuine extrapolation, and the difference matters: interpolating between two
+    well-populated lengths is sound, guessing past the end is not.
+    """
+    if not support:
+        return None
+    lengths = sorted(int(k) for k in support)
+    if segments > lengths[-1] or segments < lengths[0]:
+        return None
+    below = max(n for n in lengths if n <= segments)
+    above = min(n for n in lengths if n >= segments)
+    return min(int(support[str(below)]), int(support[str(above)]))
 
 
 def _recent_conditions(
@@ -337,11 +368,19 @@ def _predict(payload: dict, artifacts: Artifacts) -> dict:
     predicted = float(artifacts.booster.predict(frame[artifacts.columns])[0])
 
     warnings: list[str] = []
-    if journey["n_segments"] > MAX_TRAINED_SEGMENTS:
+    segments = journey["n_segments"]
+    support = _training_support(segments, artifacts.training_support)
+    if support is None:
         warnings.append(
-            f"journey spans {journey['n_segments']} segments but the model was trained "
-            f"to {MAX_TRAINED_SEGMENTS}; this prediction is extrapolated and unreliable"
+            f"journey spans {segments} segments, beyond anything the model was trained "
+            "on; this prediction is extrapolated and unreliable"
         )
+    elif support < MIN_TRAINING_SUPPORT:
+        warnings.append(
+            f"only {support:,} comparable training journeys near {segments} segments "
+            f"(under {MIN_TRAINING_SUPPORT:,}); treat this as weakly supported"
+        )
+
     if not np.isfinite(row.get("recent_deviation", np.nan)):
         warnings.append(
             "no traversal of the origin segment completed within the last hour; "

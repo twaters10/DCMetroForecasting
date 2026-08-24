@@ -42,7 +42,11 @@ from .journey import block_diagnostics, journey_windows
 
 logger = logging.getLogger("models.evaluate")
 
-JOURNEY_LENGTHS: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 10, 12, 15, 17)
+# Mirrors journeys.config.DEFAULT_LENGTHS so the summed segment model and the journey
+# model are scored on identical horizons. Imported rather than restated would be better,
+# but models/ must not depend on journeys/ — the segment pipeline predates it and stays
+# independently runnable.
+JOURNEY_LENGTHS: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 10, 12, 15, 17, 20, 24, 28, 32)
 
 # Written onto the frames by train.py once a BiasCalibration has been fitted.
 CALIBRATED_COLUMN = "prediction_calibrated"

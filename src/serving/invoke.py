@@ -28,11 +28,11 @@ REGION = "us-east-1"
 
 # Journeys that between them exercise every branch worth checking.
 CHECKS: tuple[tuple[str, str, str], ...] = (
-    ("Vienna", "Rosslyn", "parity — must be 19.08 min"),
-    ("Pentagon", "Rosslyn", "single segment"),
+    ("Vienna", "Rosslyn", "parity — compare against the offline prediction"),
+    ("Pentagon", "Rosslyn", "short journey, busy segment — live conditions expected"),
     ("Metro Center", "Union Station", "transfer station, resolvable"),
     ("L Enfant Plaza", "Fort Totten", "transfer station, punctuation stripped"),
-    ("Shady Grove", "Glenmont", "26 segments — extrapolation warning expected"),
+    ("Shady Grove", "Glenmont", "26 segments — near the edge of training support"),
     ("Vienna", "Glenmont", "no single-train route — refusal expected"),
     ("Fogy Botom", "Union Station", "unknown name — suggestion expected"),
 )
