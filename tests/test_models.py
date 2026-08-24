@@ -621,3 +621,113 @@ def test_unconnected_stations_are_refused():
 
     with pytest.raises(StationError, match="no scheduled trip"):
         resolve_journey("Vienna", "Metro Center", _index(), _schedule([]))
+
+
+# ------------------------------------------------ split gate: blocking vs advisory
+
+
+def _split_frame(days: int, unseen_segment: bool = False):
+    """A frame spanning `days` service dates, optionally with a cold-start segment."""
+    # Realistically dense: a real service day is ~33,000 rows, so one cold-start segment
+    # is a fraction of a percent. A sparse fixture makes a single unseen segment look
+    # like 3.45% and blocks for the right reason on the wrong data.
+    rows = []
+    for day in range(days):
+        date = f"2026-08-{7 + day:02d}"
+        for hour in range(6, 22):
+            for segment in range(20):
+                rows.append(
+                    {
+                        "service_date": date,
+                        "actual_departure_ts": datetime(
+                            2026, 8, 7 + day, hour, segment % 60, tzinfo=UTC
+                        ),
+                        "from_stop_id": f"PF_A{segment:02d}_C",
+                        "to_stop_id": f"PF_A{segment + 1:02d}_C",
+                        "local_hour": hour,
+                        "actual_duration_sec": 120,
+                    }
+                )
+    if unseen_segment:
+        # One rare segment appearing only on the final day, so it lands in validation.
+        rows.append(
+            {
+                "service_date": f"2026-08-{6 + days:02d}",
+                "actual_departure_ts": datetime(2026, 8, 6 + days, 23, tzinfo=UTC),
+                "from_stop_id": "PF_Z99_C",
+                "to_stop_id": "PF_Z98_C",
+                "local_hour": 23,
+                "actual_duration_sec": 120,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_too_few_days_blocks():
+    from src.features.split import temporal_split
+
+    _, _, report = temporal_split(_split_frame(days=5))
+    assert not report.is_trustworthy
+    assert any("service day(s) available" in w for w in report.blocking)
+
+
+def test_small_cold_start_tail_is_advisory_not_blocking():
+    """0.14% unseen segments held trustworthy at False forever. It must not block."""
+    from src.features.split import temporal_split
+
+    _, _, report = temporal_split(_split_frame(days=20, unseen_segment=True))
+
+    unseen = [w for w in report.warnings if "never in training" in w]
+    if unseen:  # only meaningful if the fixture actually produced a cold-start segment
+        assert unseen[0] not in report.blocking, "a tiny cold-start tail must not block"
+    assert report.is_trustworthy, report.warnings
+
+
+def test_advisory_warnings_are_still_reported():
+    """The change is what disqualifies, NOT what gets said. Nothing may be hidden."""
+    from src.features.split import temporal_split
+
+    _, _, report = temporal_split(_split_frame(days=20, unseen_segment=True))
+    metadata = report.as_metadata()
+
+    # Present in the metadata that travels into metrics.json and the registry manifest.
+    assert "warnings" in metadata and "blocking_warnings" in metadata
+    assert len(metadata["warnings"]) >= len(metadata["blocking_warnings"])
+    if report.warnings:
+        assert any(w in report.format() for w in report.warnings)
+
+
+def test_report_header_keys_off_blocking_only():
+    """A 0.14% note must not print 'NOT YET MEANINGFUL' — readers learn to skim it."""
+    from src.features.split import temporal_split
+
+    _, _, blocked = temporal_split(_split_frame(days=5))
+    assert "NOT YET MEANINGFUL" in blocked.format()
+
+    _, _, ok = temporal_split(_split_frame(days=20, unseen_segment=True))
+    assert "NOT YET MEANINGFUL" not in ok.format()
+
+
+def test_repackaging_different_contents_yields_a_different_key(tmp_path):
+    """v1-v4 all resolved to one S3 file because the key ignored contents.
+
+    The key must change when the bytes change, or a registry version can be silently
+    replaced by a later packaging of the same training run.
+    """
+    import hashlib
+    from datetime import UTC, datetime
+
+    from src.models.artifacts import new_run_dir, package
+
+    def key_for(run, contents: str) -> str:
+        (run / "model.txt").write_text(contents)
+        archive = package(run, output=run / f"{contents}.tar.gz")
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()[:8]
+        return f"models/journey_duration/{run.name}/{digest}/model.tar.gz"
+
+    run = new_run_dir(tmp_path, datetime(2026, 8, 23, 9, 0, tzinfo=UTC))
+    first = key_for(run, "packaging-one")
+    second = key_for(run, "packaging-two")
+
+    assert first != second, "same run, different bytes, must not collide"
+    assert run.name in first and run.name in second, "run id stays traceable in the key"

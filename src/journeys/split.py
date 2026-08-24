@@ -45,10 +45,13 @@ class JourneySplitReport:
     train_days: list[str]
     validation_days: list[str]
     warnings: list[str] = field(default_factory=list)
+    # Same blocking/advisory split as features.split.SplitReport — see the reasoning
+    # there. Every warning is still reported; only some disqualify a score.
+    blocking: list[str] = field(default_factory=list)
 
     @property
     def is_trustworthy(self) -> bool:
-        return not self.warnings
+        return not self.blocking
 
     def as_metadata(self) -> dict[str, object]:
         return {
@@ -62,6 +65,7 @@ class JourneySplitReport:
             "train_days": self.train_days,
             "validation_days": self.validation_days,
             "warnings": self.warnings,
+            "blocking_warnings": self.blocking,
             "trustworthy": self.is_trustworthy,
         }
 
@@ -77,9 +81,13 @@ class JourneySplitReport:
             f"{len(self.validation_days)} day(s)",
             f"  embargoed from train {self.embargoed_rows:,} rows",
         ]
-        if self.warnings:
+        if self.blocking:
             lines.append("  !! THIS SPLIT IS NOT YET MEANINGFUL")
-            lines += [f"     - {w}" for w in self.warnings]
+        elif self.warnings:
+            lines.append("  usable, with caveats")
+        for warning in self.warnings:
+            marker = "!!" if warning in self.blocking else "--"
+            lines.append(f"     {marker} {warning}")
         return "\n".join(lines)
 
 
@@ -114,20 +122,25 @@ def split_journeys(
     )
 
     warnings: list[str] = []
+    blocking: list[str] = []
+
+    def add(message: str, *, blocks: bool = True) -> None:
+        warnings.append(message)
+        if blocks:
+            blocking.append(message)
+
     all_days = sorted(set(train_days) | set(validation_days))
     if len(all_days) < MIN_DAYS_FOR_MEANINGFUL_SPLIT:
-        warnings.append(
+        add(
             f"only {len(all_days)} service day(s) available; "
             f"{MIN_DAYS_FOR_MEANINGFUL_SPLIT} are needed before a temporal split can "
             "separate day-of-week from time"
         )
     if len(validation_days) < 2:
-        warnings.append(
-            "validation spans a single service date; a score from it reflects that day"
-        )
+        add("validation spans a single service date; a score from it reflects that day")
     overlap = set(train_days) & set(validation_days)
     if len(validation_days) and set(validation_days) <= overlap:
-        warnings.append(
+        add(
             "every validation day also appears in training — the boundary falls "
             "mid-day, so day-level effects are shared across both sides"
         )
@@ -143,6 +156,7 @@ def split_journeys(
         train_days=train_days,
         validation_days=validation_days,
         warnings=warnings,
+        blocking=blocking,
     )
     if report.warnings:
         logger.warning("journey split is not yet meaningful:\n%s", report.format())

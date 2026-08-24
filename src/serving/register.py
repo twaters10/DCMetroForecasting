@@ -28,6 +28,7 @@ Approving a version is a deliberate, separate act:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import shutil
@@ -50,6 +51,23 @@ REGION = "us-east-1"
 # dedicated LightGBM image would skip that install but means maintaining a container.
 FRAMEWORK = "sklearn"
 FRAMEWORK_VERSION = "1.2-1"
+
+# Training and serving deliberately run DIFFERENT LightGBM versions: the sklearn 1.2-1
+# container is Python 3.9 and 4.7.0 requires >=3.10, so serving pins 4.6.0. The skew is
+# verified rather than assumed: 4.6.0 reading the 4.7.0-written model.txt reproduced
+# its predictions to a maximum absolute difference of 0.0.
+#
+# Recorded on the registry entry because a version difference between train and serve is
+# exactly what an incident review goes looking for, and it should not require unpacking
+# the artifact to discover.
+LIGHTGBM_TRAIN_VERSION = "4.7.0"
+LIGHTGBM_SERVE_VERSION = "4.6.0"
+
+
+def _date_range(manifest: dict) -> str:
+    """`2026-08-07 to 2026-08-22`. Commas are illegal in registry metadata values."""
+    dates = manifest["training_data"]["service_dates"]
+    return f"{dates[0]} to {dates[-1]}" if dates else "unknown"
 
 
 def staged_serving_dir(destination: Path) -> Path:
@@ -151,7 +169,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     config = EtlConfig.from_env()
-    key = f"models/journey_duration/{manifest['run_id']}/model.tar.gz"
+    # Keyed on run id AND a hash of the archive. Keying on run id alone meant
+    # re-packaging the same run overwrote the previous version's artifact — versions 1
+    # through 4 all resolved to the same file, each describing a packaging its bytes no
+    # longer matched. A registry version that can change underneath you is worthless.
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()[:8]
+    key = f"models/journey_duration/{manifest['run_id']}/{digest}/model.tar.gz"
     boto3.client("s3", region_name=config.aws_region).upload_file(
         str(archive), config.s3_bucket, key
     )
@@ -183,8 +206,24 @@ def main(argv: list[str] | None = None) -> int:
         },
         # Never Approved automatically. See the module docstring.
         ModelApprovalStatus="PendingManualApproval",
+        # Values must match [\p{L}\p{Z}\p{N}_.:/=+\-@] — no braces, quotes or commas,
+        # which is why date_range uses "to" and nothing here is JSON-encoded.
         CustomerMetadataProperties={
+            # --- what this model IS ---
+            "algorithm": "lightgbm",
+            "objective": str(manifest["params"].get("objective", "unknown")),
+            "framework": f"sagemaker-scikit-learn:{FRAMEWORK_VERSION}-cpu-py3",
+            "target": manifest["target"],
+            "target_description": "arrival at B minus arrival at A in seconds",
+            "n_features": str(manifest["feature_schema"]["n_features"]),
+            "n_categorical": str(len(manifest["feature_schema"]["categorical"])),
+            "lightgbm_train_version": LIGHTGBM_TRAIN_VERSION,
+            "lightgbm_serve_version": LIGHTGBM_SERVE_VERSION,
+            "date_range": _date_range(manifest),
+            "validation_rows": str(manifest["training_data"]["validation_rows"]),
+            # --- where it came from and how it scored ---
             "run_id": manifest["run_id"],
+            "artifact_sha8": digest,
             "trustworthy": str(manifest["trustworthy"]),
             "git_commit": str(manifest["git"]["commit"]),
             "git_dirty": str(manifest["git"]["dirty"]),

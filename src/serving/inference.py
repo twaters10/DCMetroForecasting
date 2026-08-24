@@ -40,8 +40,11 @@ skew no offline metric would reveal.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
+import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +71,16 @@ ROLLING_MAX_AGE_SEC = 3600
 # own failure, but they are flagged on the response so a caller cannot mistake one for a
 # supported prediction. The real fix is to train on longer windows.
 MAX_TRAINED_SEGMENTS = 17
+
+# Where the collector Lambda writes the live recent-conditions table, refreshed every
+# few minutes. Read per request rather than baked into model.tar.gz: the bundled copy is
+# batch-built from COMPLETED service days and is hours old before it ships, so every
+# entry falls outside the 3600s window and every `recent_*` feature is null.
+LIVE_LOOKUP_KEY = "models/serving/recent_conditions_live.csv"
+
+# A warm container should not re-download per request, but must never serve an hour-old
+# view of "recent". 60s is well inside the staleness window and cheap at this traffic.
+LIVE_LOOKUP_TTL_SEC = 60
 SERVICE_TZ = "America/New_York"
 FARE_EVENING_START_HOUR = 21.5
 
@@ -105,10 +118,17 @@ class Artifacts:
         self.schedule = pd.read_csv(directory / "journey_schedule.csv")
         # `parse_dates` is load-bearing: CSV carries no dtypes, and the staleness rule
         # needs a real timestamp rather than the string it would otherwise get back.
-        self.lookup = pd.read_csv(
-            directory / "recent_conditions_lookup.csv", parse_dates=["completed_at"]
+        # The bundled lookup is a FALLBACK only. It ships with the model so the endpoint
+        # can answer at all if S3 is unreachable, but it is batch-built and therefore
+        # always stale — serving from it means null recent_* features.
+        self.fallback_lookup = _indexed(
+            pd.read_csv(
+                directory / "recent_conditions_lookup.csv", parse_dates=["completed_at"]
+            )
         )
-        self.lookup = self.lookup.set_index(["from_stop_id", "to_stop_id"])
+        self._live_lookup: pd.DataFrame | None = None
+        self._live_fetched_at: float = 0.0
+        self.bucket = os.environ.get("S3_BUCKET", "")
         self.run_id = json.loads((directory / "manifest.json").read_text())["run_id"]
         self.trustworthy = json.loads((directory / "manifest.json").read_text())[
             "trustworthy"
@@ -118,8 +138,49 @@ class Artifacts:
             self.run_id,
             len(self.columns),
             len(self.schedule),
-            len(self.lookup),
+            len(self.fallback_lookup),
         )
+
+
+def _indexed(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame.set_index(["from_stop_id", "to_stop_id"])
+
+
+def live_lookup(artifacts: Artifacts) -> pd.DataFrame:
+    """The freshest recent-conditions table available, cached for `LIVE_LOOKUP_TTL_SEC`.
+
+    Falls back to the bundled copy on any failure — missing object, permissions, bad
+    CSV. **Degrading to stale data means null `recent_*` features, which is exactly the
+    endpoint's behaviour today and is safe.** Raising instead would turn a refresh
+    problem into an outage, and the model handles missing features natively.
+    """
+    now = time.monotonic()
+    if (
+        artifacts._live_lookup is not None
+        and now - artifacts._live_fetched_at < LIVE_LOOKUP_TTL_SEC
+    ):
+        return artifacts._live_lookup
+    if not artifacts.bucket:
+        return artifacts.fallback_lookup
+
+    try:
+        import boto3
+
+        body = (
+            boto3.client("s3")
+            .get_object(Bucket=artifacts.bucket, Key=LIVE_LOOKUP_KEY)["Body"]
+            .read()
+        )
+        frame = _indexed(pd.read_csv(io.BytesIO(body), parse_dates=["completed_at"]))
+        artifacts._live_lookup = frame
+        artifacts._live_fetched_at = now
+        logger.info("refreshed live lookup: %d segment(s)", len(frame))
+        return frame
+    except Exception as error:  # noqa: BLE001 - degrade, never fail a prediction
+        logger.warning("live lookup unavailable (%s); using the bundled copy", error)
+        artifacts._live_lookup = artifacts.fallback_lookup
+        artifacts._live_fetched_at = now
+        return artifacts.fallback_lookup
 
 
 def model_fn(model_dir: str) -> Artifacts:
@@ -177,10 +238,11 @@ def _recent_conditions(
         "recent_deviation": np.nan,
         "recent_age_sec": np.nan,
     }
-    if segment not in artifacts.lookup.index:
+    table = live_lookup(artifacts)
+    if segment not in table.index:
         return blank
 
-    row = artifacts.lookup.loc[segment]
+    row = table.loc[segment]
     if isinstance(row, pd.DataFrame):
         row = row.iloc[0]
 

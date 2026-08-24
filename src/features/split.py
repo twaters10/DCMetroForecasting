@@ -40,6 +40,15 @@ logger = logging.getLogger("features.split")
 # on either side of a boundary.
 MIN_DAYS_FOR_MEANINGFUL_SPLIT = 14
 
+# Cold-start segments are a permanent feature of this network — late-night patterns and
+# rare reroutes mean a handful of segments will always appear in validation and never in
+# training. Measured at 13 days: 81 segments, 0.14% of validation rows.
+#
+# Treating any unseen segment as disqualifying held `is_trustworthy` at False forever,
+# which makes it useless as the thing a registry gates on. It blocks only once the tail
+# is large enough to actually distort the metric.
+UNSEEN_SEGMENT_BLOCKING_PCT = 2.0
+
 
 @dataclass(frozen=True, slots=True)
 class SplitReport:
@@ -54,10 +63,20 @@ class SplitReport:
     validation_days: list[str]
     unseen_segments: int
     warnings: list[str] = field(default_factory=list)
+    # Warnings that genuinely invalidate a score, as opposed to ones worth stating.
+    # Kept as a separate list rather than re-derived, so `is_trustworthy` cannot drift
+    # from the text that was actually reported.
+    blocking: list[str] = field(default_factory=list)
 
     @property
     def is_trustworthy(self) -> bool:
-        return not self.warnings
+        """No BLOCKING warning. Advisory ones are still reported everywhere.
+
+        The distinction is what counts as disqualifying, not what gets said. Every
+        warning still prints, still lands in `metrics.json`, and still travels into the
+        registry manifest.
+        """
+        return not self.blocking
 
     def as_metadata(self) -> dict[str, object]:
         """Recorded beside the feature table so a model traces back to its split."""
@@ -71,6 +90,7 @@ class SplitReport:
             "validation_days": self.validation_days,
             "unseen_segments": self.unseen_segments,
             "warnings": self.warnings,
+            "blocking_warnings": self.blocking,
             "trustworthy": self.is_trustworthy,
         }
 
@@ -86,11 +106,18 @@ class SplitReport:
             f"  embargoed from train {self.embargoed_rows:,} rows",
             f"  segments unseen in training {self.unseen_segments}",
         ]
-        if self.warnings:
+        # Header keyed on BLOCKING warnings only. Printing "not yet meaningful" over a
+        # 0.14% cold-start note would train the reader to skim past the header, which is
+        # exactly when a real blocking warning gets missed.
+        if self.blocking:
             lines.append("  !! THIS SPLIT IS NOT YET MEANINGFUL")
-            lines.extend(f"     - {w}" for w in self.warnings)
+        elif self.warnings:
+            lines.append("  usable, with caveats")
         else:
             lines.append("  no warnings")
+        for warning in self.warnings:
+            marker = "!!" if warning in self.blocking else "--"
+            lines.append(f"     {marker} {warning}")
         return "\n".join(lines)
 
 
@@ -133,6 +160,13 @@ def temporal_split(
         p for p, keep in zip(segment_pairs, validation_mask, strict=True) if keep
     } - train_segments
 
+    all_warnings, blocking = _warnings(
+        features,
+        train_days,
+        validation_days,
+        len(unseen),
+        validation_rows=int(validation_mask.sum()),
+    )
     report = SplitReport(
         boundary=boundary.to_pydatetime(),
         embargo_sec=settings.embargo_sec,
@@ -142,7 +176,8 @@ def temporal_split(
         train_days=train_days,
         validation_days=validation_days,
         unseen_segments=len(unseen),
-        warnings=_warnings(features, train_days, validation_days, len(unseen)),
+        warnings=all_warnings,
+        blocking=blocking,
     )
 
     if report.warnings:
@@ -155,41 +190,60 @@ def _warnings(
     train_days: list[str],
     validation_days: list[str],
     unseen: int,
-) -> list[str]:
+    validation_rows: int = 0,
+) -> tuple[list[str], list[str]]:
     """Every reason this split should not be used to make a claim.
 
-    Returned rather than raised: producing the split is still useful for exercising the
-    plumbing, and a backfill may legitimately want it. What must not happen is a number
-    coming out of it that reads like a generalisation estimate.
+    Returns `(all_warnings, blocking_warnings)`. Returned rather than raised: producing
+    the split is still useful for exercising the plumbing, and a backfill may want it.
+    What must not happen is a number coming out of it that reads like a generalisation
+    estimate.
+
+    **Blocking** means the score is invalid — too few days to separate day-of-week from
+    time, or a validation set so narrow it measures one day rather than generalisation.
+    **Advisory** means worth stating but not disqualifying; a 0.14% cold-start tail is
+    real and should be visible, and it is not a reason to reject a model.
     """
     warnings: list[str] = []
+    blocking: list[str] = []
     all_days = sorted(features["service_date"].astype(str).unique())
 
+    def add(message: str, *, blocks: bool) -> None:
+        warnings.append(message)
+        if blocks:
+            blocking.append(message)
+
     if len(all_days) < MIN_DAYS_FOR_MEANINGFUL_SPLIT:
-        warnings.append(
+        add(
             f"only {len(all_days)} service day(s) available; "
             f"{MIN_DAYS_FOR_MEANINGFUL_SPLIT} are needed before a temporal split can "
-            "separate day-of-week from time"
+            "separate day-of-week from time",
+            blocks=True,
         )
 
     if validation_days:
         weekdays = {pd.Timestamp(d).day_name() for d in validation_days}
         if len(weekdays) == 1:
-            warnings.append(
+            add(
                 f"validation covers only {weekdays.pop()} — day-of-week is a "
-                "feature, so the split confounds what it is meant to measure"
+                "feature, so the split confounds what it is meant to measure",
+                blocks=True,
             )
 
     if len(validation_days) == 1:
-        warnings.append(
+        add(
             "validation spans a single service date; a score from it reflects that "
-            "day, not generalisation"
+            "day, not generalisation",
+            blocks=True,
         )
 
     if unseen:
-        warnings.append(
+        share = 100 * unseen / validation_rows if validation_rows else 0.0
+        add(
             f"{unseen} segment(s) appear in validation but never in training — "
-            "cold-start categoricals the model has no basis to predict"
+            f"cold-start categoricals the model has no basis to predict "
+            f"({share:.2f}% of validation rows)",
+            blocks=share > UNSEEN_SEGMENT_BLOCKING_PCT,
         )
 
-    return warnings
+    return warnings, blocking

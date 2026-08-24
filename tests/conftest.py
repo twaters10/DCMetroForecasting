@@ -12,6 +12,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 COLLECTOR_DIR = ROOT / "infra" / "lambda_collector"
 
@@ -22,3 +24,21 @@ COLLECTOR_DIR = ROOT / "infra" / "lambda_collector"
 for directory in (COLLECTOR_DIR, ROOT, Path(__file__).resolve().parent):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
+
+
+@pytest.fixture(scope="session")
+def spark():
+    """One SparkSession for the whole run.
+
+    Lives here rather than in `test_etl.py` because `test_arrivals_parity.py` needs it
+    too — the parity test compares the Spark derivation against the pandas one, so it
+    cannot avoid starting a session.
+
+    Session-scoped, not module-scoped: a JVM start costs seconds, and two modules each
+    starting their own doubles that for no benefit.
+    """
+    from src.etl.spark import build_session
+
+    session = build_session(app_name="etl-tests", shuffle_partitions=1, cores="1")
+    yield session
+    session.stop()

@@ -186,15 +186,6 @@ def test_zero_timestamps_are_treated_as_missing_not_as_1970():
 # --------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def spark():
-    from src.etl.spark import build_session
-
-    session = build_session(app_name="etl-tests", shuffle_partitions=1, cores="1")
-    yield session
-    session.stop()
-
-
 def stage(spark, tmp_path, snapshots, kind: str):
     """Decode snapshots to Parquet and read them back as Spark would in production."""
     builder, schema = (

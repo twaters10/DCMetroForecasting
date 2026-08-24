@@ -43,7 +43,18 @@ TARGET_ARCH_TOKEN="aarch64" # what a correct binary wheel tag must contain
 # would break only the daily static task and leave the 60-second one healthy —
 # exactly the kind of partial failure that goes unnoticed, so the verification
 # step below checks for it like the rest.
-HANDLER_MODULES=(handler.py config.py writers.py static_gtfs.py)
+HANDLER_MODULES=(handler.py config.py writers.py static_gtfs.py recent_conditions.py)
+
+# Shared ETL code, shipped as a PACKAGE rather than at the zip root. `src/etl/config.py`
+# and the collector's own `config.py` are two different modules with the same name, so a
+# flat copy would shadow one with the other — the same collision tests/conftest.py
+# documents. Under `metro_etl/` the import is unambiguous.
+#
+# `arrivals_live.py` is the pandas port of the Spark arrival derivation, kept honest by
+# tests/test_arrivals_parity.py. It is imported here, never reimplemented: a third copy
+# of those rules would defeat the parity test entirely.
+SHARED_PACKAGE_DIR="metro_etl"
+SHARED_MODULES=(../../src/etl/config.py ../../src/etl/arrivals_live.py)
 
 # Lambda limits for a direct (non-S3) upload.
 ZIP_LIMIT_MB=50
@@ -178,6 +189,18 @@ for module in "${HANDLER_MODULES[@]}"; do
   (cd "$SCRIPT_DIR" && zip -q -X "$ZIP_PATH" "$module")
   log "added $module"
 done
+
+# Shared ETL package. Staged into the build dir first so the archive paths come out as
+# metro_etl/*.py rather than carrying the source tree's layout.
+SHARED_STAGE="$BUILD_DIR/$SHARED_PACKAGE_DIR"
+mkdir -p "$SHARED_STAGE"
+: >"$SHARED_STAGE/__init__.py"
+for module in "${SHARED_MODULES[@]}"; do
+  [[ -f "$SCRIPT_DIR/$module" ]] || fail "expected shared module not found: $module"
+  cp "$SCRIPT_DIR/$module" "$SHARED_STAGE/"
+done
+(cd "$BUILD_DIR" && zip -q -r -X "$ZIP_PATH" "$SHARED_PACKAGE_DIR")
+log "added $SHARED_PACKAGE_DIR/ (${#SHARED_MODULES[@]} shared module(s))"
 
 # --------------------------------------------------------------------------
 # 7. Verify the assembled layout, then report size.

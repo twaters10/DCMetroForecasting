@@ -55,15 +55,14 @@ downstream modelling can weight or filter on provenance instead of trusting a bl
 
 from __future__ import annotations
 
-from typing import Final
-
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
-from .config import MAX_ARRIVAL_BRACKET_SEC
-
-SOURCE_VEHICLE_POSITION: Final[str] = "vehicle_position"
-SOURCE_TRIP_UPDATE: Final[str] = "trip_update"
+from .config import (
+    MAX_ARRIVAL_BRACKET_SEC,
+    SOURCE_TRIP_UPDATE,
+    SOURCE_VEHICLE_POSITION,
+)
 
 
 def derive_vp_arrivals(observations: DataFrame) -> DataFrame:

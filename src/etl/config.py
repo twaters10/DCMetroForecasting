@@ -74,6 +74,12 @@ SAMPLING_QUANTIZATION_SEC: Final[int] = 60
 # are more precise.
 MAX_ARRIVAL_BRACKET_SEC: Final[int] = 3 * SAMPLING_QUANTIZATION_SEC
 
+# How an arrival was derived. Defined here rather than in `arrivals.py` because that
+# module imports pyspark at module scope, and the live derivation runs in a Lambda that
+# has no Spark. One definition shared by both implementations, not two that agree today.
+SOURCE_VEHICLE_POSITION: Final[str] = "vehicle_position"
+SOURCE_TRIP_UPDATE: Final[str] = "trip_update"
+
 # WMATA sometimes sets `arrival.time` to 0 rather than omitting the field (473 of
 # 629,030 stop_time_updates in a sampled 3-hour rail window). Zero is a valid
 # protobuf int but not a valid 2026 timestamp, and it silently destroys any min/max

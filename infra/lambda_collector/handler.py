@@ -65,6 +65,7 @@ _WRITER: SnapshotWriter | None = None
 # history.
 _TASK_KEY: Final[str] = "task"
 _STATIC_GTFS_TASK: Final[str] = "static_gtfs"
+_RECENT_CONDITIONS_TASK: Final[str] = "recent_conditions"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +95,19 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # thing the ETL can join across feeds without a tolerance window.
     captured_at = datetime.now(UTC)
 
-    if (event or {}).get(_TASK_KEY) == _STATIC_GTFS_TASK:
+    task = (event or {}).get(_TASK_KEY)
+
+    if task == _RECENT_CONDITIONS_TASK:
+        # Deferred import for the same reason as the static task: nothing in this path,
+        # including its pandas dependency, may be able to stop the 60-second realtime
+        # collection. Realtime history cannot be backfilled; a missed lookup refresh
+        # just leaves the endpoint on its last good copy for five more minutes.
+        import boto3
+        from recent_conditions import build_recent_conditions
+
+        return build_recent_conditions(config, boto3.client("s3"))
+
+    if task == _STATIC_GTFS_TASK:
         # Imported here rather than at module scope so that nothing in the static
         # path — including a bad import in it or its dependencies — can stop the
         # realtime collection this function exists for. Realtime history cannot be
