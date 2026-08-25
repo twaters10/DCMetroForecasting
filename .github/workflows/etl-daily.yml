@@ -1,9 +1,14 @@
 # Daily ETL: raw GTFS-realtime snapshots -> trip-segment table in S3.
 #
-# Runs here rather than on a laptop for one concrete reason: macOS TCC denies a
-# LaunchAgent read access to anything under ~/Documents, where this repo lives, so a
-# local schedule cannot execute the pipeline at all (exit 126, "Operation not
-# permitted"). A hosted runner has no such constraint and is awake every night.
+# MANUAL ONLY. The daily schedule now runs on the laptop via cron — see
+# scripts/install_etl_cron.sh. This workflow is kept for on-demand runs from a machine
+# that is not the laptop, and as a fallback if the local schedule is ever removed.
+#
+# The earlier rationale for running here was that macOS TCC denied a local schedule
+# any access to ~/Documents. That was measured with a LaunchAgent, and TCC grants
+# access per BINARY: /bin/bash is denied, but .venv/bin/python resolves to
+# /Library/Frameworks/Python.framework, which holds Full Disk Access and reads the
+# repo fine. Driving cron straight at that interpreter sidesteps the block entirely.
 #
 # What this does NOT do is decide which dates to process. `src.etl.catchup` asks S3
 # which complete service days are missing and processes those, so a skipped or delayed
@@ -13,11 +18,10 @@
 name: etl-daily
 
 on:
-  schedule:
-    # 07:00 UTC. A service day closes at 04:00 UTC under EDT and 05:00 UTC under EST,
-    # and GitHub cron is always UTC with no DST handling — 07:00 clears both with
-    # margin. GitHub may delay scheduled runs under load; the catch-up logic absorbs it.
-    - cron: "0 7 * * *"
+  # Schedule deliberately removed rather than commented into a disabled state: GitHub
+  # also auto-disables scheduled workflows after 60 days of repository inactivity, so
+  # a dormant `schedule:` block leaves it genuinely ambiguous whether the daily run is
+  # off by choice or by neglect. The laptop cron entry is now the only schedule.
   workflow_dispatch:
     inputs:
       mode:

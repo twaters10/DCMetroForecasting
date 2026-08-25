@@ -17,7 +17,7 @@ PROFILE := metro-pulse
 START   := 2026-08-07
 
 .DEFAULT_GOAL := help
-.PHONY: help etl features train publish retrain monitor transfers check register-hint ui
+.PHONY: help etl features train publish retrain monitor transfers check register-hint ui install-cron uninstall-cron cron-log
 
 help:
 	@echo "make etl        - process outstanding service days, sync to S3"
@@ -29,6 +29,8 @@ help:
 	@echo "make transfers  - score composed two-leg predictions on real transfers"
 	@echo "make check      - tests, lint, format"
 	@echo "make ui         - launch the local Streamlit app over the endpoint"
+	@echo "make install-cron   - schedule the daily ETL locally (replaces CI)"
+	@echo "make cron-log       - tail the scheduled run log"
 
 etl:
 	./scripts/run_etl_daily.sh
@@ -80,3 +82,15 @@ check:
 # project's "only managed compute" claim stays true.
 ui:
 	AWS_PROFILE=$(PROFILE) .venv/bin/streamlit run src/ui/app.py
+
+# The launcher is COPIED outside ~/Documents because macOS TCC will not let
+# /bin/bash read a script stored in the repo. Re-run this after editing
+# scripts/etl_cron.sh, or the installed copy keeps running the old version.
+install-cron:
+	./scripts/install_etl_cron.sh
+
+uninstall-cron:
+	./scripts/install_etl_cron.sh --uninstall
+
+cron-log:
+	tail -n 40 "$$HOME/Library/Logs/metro-pulse/etl-$$(date +%Y-%m).log"
