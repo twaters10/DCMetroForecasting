@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 
 from ..etl.config import EtlConfig
-from ..models.artifacts import package, resolve_run
+from ..models.artifacts import _git_state, package, resolve_run
 
 logger = logging.getLogger("serving.register")
 
@@ -259,6 +259,13 @@ def main(argv: list[str] | None = None) -> int:
             "trustworthy": str(manifest["trustworthy"]),
             "git_commit": str(manifest["git"]["commit"]),
             "git_dirty": str(manifest["git"]["dirty"]),
+            # The manifest's commit describes the code that TRAINED the model. The
+            # inference handler, station index and routing tables are packaged now and
+            # can move without retraining — as they did when transfer journeys were
+            # added — so the serving commit is recorded separately. Reading one for the
+            # other would misdescribe the archive's contents.
+            "serving_commit": str(_git_state()["commit"]),
+            "serving_dirty": str(_git_state()["dirty"]),
             "service_dates": str(len(manifest["training_data"]["service_dates"])),
             "train_rows": str(manifest["training_data"]["train_rows"]),
             "best_iteration": str(manifest["best_iteration"]),
