@@ -17,7 +17,7 @@ PROFILE := metro-pulse
 START   := 2026-08-07
 
 .DEFAULT_GOAL := help
-.PHONY: help etl features train publish retrain monitor check register-hint ui
+.PHONY: help etl features train publish retrain monitor transfers check register-hint ui
 
 help:
 	@echo "make etl        - process outstanding service days, sync to S3"
@@ -26,6 +26,7 @@ help:
 	@echo "make publish    - refresh the serving inputs (NEVER skip this)"
 	@echo "make retrain    - etl -> features -> train -> publish, failing fast"
 	@echo "make monitor    - score yesterday against ground truth, publish metrics"
+	@echo "make transfers  - score composed two-leg predictions on real transfers"
 	@echo "make check      - tests, lint, format"
 	@echo "make ui         - launch the local Streamlit app over the endpoint"
 
@@ -62,6 +63,12 @@ register-hint:
 
 monitor:
 	AWS_PROFILE=$(PROFILE) $(PY) -m src.monitoring.report
+
+# Local only, and no AWS: it reads the journey table and the model straight from
+# disk. Run it after `train`, because it scores whatever `latest` points at.
+transfers:
+	$(PY) -m src.journeys.transfers \
+		--output data/models/journey_duration/latest/transfer_validation.json
 
 check:
 	JAVA_HOME=$${JAVA_HOME:-/opt/homebrew/opt/openjdk@17} $(PY) -m pytest tests/ -q

@@ -54,8 +54,14 @@ import pandas as pd
 # inside the container even though it works everywhere else. Both forms are attempted so
 # the same file runs under pytest, locally, and in the container without editing.
 try:  # package context: tests and local use
+    from .routing import NoItineraryError, TransferGraph, service_position
     from .stations import StationError, StationIndex, resolve_journey
 except ImportError:  # flat context: code/ inside model.tar.gz
+    from routing import (  # type: ignore
+        NoItineraryError,
+        TransferGraph,
+        service_position,
+    )
     from stations import StationError, StationIndex, resolve_journey  # type: ignore
 
 logger = logging.getLogger("serving.inference")
@@ -72,6 +78,11 @@ ROLLING_MAX_AGE_SEC = 3600
 # claim, and a single MAX_TRAINED_SEGMENTS would let the model answer at 32 as
 # confidently as at 4.
 MIN_TRAINING_SUPPORT = 1000
+
+# Below this, a connection is worth flagging: the rider has under a minute on the
+# platform, and a first leg running even slightly late turns the short wait into a
+# full headway.
+TIGHT_CONNECTION_SEC = 60
 
 # Fallback only, for a manifest written before per-length support was recorded.
 FALLBACK_MAX_SEGMENTS = 17
@@ -130,6 +141,19 @@ class Artifacts:
                 directory / "recent_conditions_lookup.csv", parse_dates=["completed_at"]
             )
         )
+        # Routing artifacts are optional so an older model.tar.gz still loads: without
+        # them the endpoint simply refuses transfer journeys exactly as it did before.
+        routing_files = ("walk_edges.csv", "departures.csv", "service_calendar.csv")
+        if all((directory / name).exists() for name in routing_files):
+            self.graph: TransferGraph | None = TransferGraph.from_directory(
+                directory, self.index, self.schedule
+            )
+        else:
+            logger.warning(
+                "routing artifacts absent (%s) — transfer journeys will be refused",
+                ", ".join(routing_files),
+            )
+            self.graph = None
         self._live_lookup: pd.DataFrame | None = None
         self._live_fetched_at: float = 0.0
         self.bucket = os.environ.get("S3_BUCKET", "")
@@ -319,6 +343,77 @@ def _recent_conditions(
     return {**blank, **values}
 
 
+def _station_name(artifacts: Artifacts, stop_id: str) -> str:
+    return artifacts.index.code_to_name[stop_id[3:6]]
+
+
+def _feature_row(artifacts: Artifacts, journey: dict, when: pd.Timestamp) -> dict:
+    """The one-row feature frame a single-train ride is predicted from.
+
+    Shared by direct journeys and by each leg of a transfer, so a leg is fed to the
+    model exactly as a whole journey would be — which is the only reason legs can be
+    predicted at all without retraining.
+    """
+    row: dict = {
+        "n_segments": journey["n_segments"],
+        "scheduled_total_sec": journey["scheduled_total_sec"],
+        "stops_spanned": journey["stops_spanned"],
+        "route_id": journey["route_id"],
+        "direction_id": journey["direction_id"],
+        "from_station": journey["origin_stop_id"][3:6],
+        "to_station": journey["destination_stop_id"][3:6],
+        **_calendar_features(when),
+        **_recent_conditions(
+            artifacts, (journey["origin_stop_id"], journey["first_leg_to"]), when
+        ),
+    }
+    for feature in TRIP_STATE_FEATURES:
+        row.setdefault(feature, np.nan)
+    return row
+
+
+def _score(artifacts: Artifacts, row: dict) -> tuple[float, float | None]:
+    """(median prediction, p80 prediction) for one feature row."""
+    frame = pd.DataFrame([row])
+    for column, codes in artifacts.encoder_mapping.items():
+        if column in frame.columns:
+            frame[column] = (
+                frame[column].astype(str).map(codes).fillna(-1).astype("int32")
+            )
+
+    missing = [c for c in artifacts.columns if c not in frame.columns]
+    if missing:
+        raise ValueError(f"handler failed to produce required feature(s): {missing}")
+
+    matrix = frame[artifacts.columns]
+    predicted = float(artifacts.booster.predict(matrix)[0])
+    upper = (
+        float(artifacts.quantile_booster.predict(matrix)[0])
+        if artifacts.quantile_booster is not None
+        else None
+    )
+    return predicted, upper
+
+
+def _support_warnings(
+    artifacts: Artifacts, segments: int, prefix: str = ""
+) -> list[str]:
+    """Warn when a journey length sits outside or thinly inside the trained range."""
+    warnings: list[str] = []
+    support = _training_support(segments, artifacts.training_support)
+    if support is None:
+        warnings.append(
+            f"{prefix}journey spans {segments} segments, beyond anything the model was "
+            "trained on; this prediction is extrapolated and unreliable"
+        )
+    elif support < MIN_TRAINING_SUPPORT:
+        warnings.append(
+            f"{prefix}only {support:,} comparable training journeys near {segments} "
+            f"segments (under {MIN_TRAINING_SUPPORT:,}); treat this as weakly supported"
+        )
+    return warnings
+
+
 def predict_fn(payload: dict, artifacts: Artifacts) -> dict:
     """Predict, or return a structured error.
 
@@ -353,6 +448,20 @@ def _predict(payload: dict, artifacts: Artifacts) -> dict:
     when = when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")
     local_hour = when.tz_convert(SERVICE_TZ).hour
 
+    # Dispatch on whether one train connects the two stations, rather than on catching
+    # the resolver's failure: `resolve_journey` also refuses genuinely ambiguous
+    # platform pairs, and that refusal must survive rather than be rerouted around.
+    if artifacts.graph is not None and not artifacts.graph.is_direct(
+        payload["origin"], payload["destination"]
+    ):
+        return _predict_transfer(payload, artifacts, when, local_hour)
+
+    return _predict_direct(payload, artifacts, when, local_hour)
+
+
+def _predict_direct(
+    payload: dict, artifacts: Artifacts, when: pd.Timestamp, local_hour: int
+) -> dict:
     journey = resolve_journey(
         payload["origin"],
         payload["destination"],
@@ -361,49 +470,11 @@ def _predict(payload: dict, artifacts: Artifacts) -> dict:
         local_hour,
     )
 
-    row: dict = {
-        "n_segments": journey["n_segments"],
-        "scheduled_total_sec": journey["scheduled_total_sec"],
-        "stops_spanned": journey["stops_spanned"],
-        "route_id": journey["route_id"],
-        "direction_id": journey["direction_id"],
-        "from_station": journey["origin_stop_id"][3:6],
-        "to_station": journey["destination_stop_id"][3:6],
-        **_calendar_features(when),
-        **_recent_conditions(
-            artifacts, (journey["origin_stop_id"], journey["first_leg_to"]), when
-        ),
-    }
-    for feature in TRIP_STATE_FEATURES:
-        row.setdefault(feature, np.nan)
+    row = _feature_row(artifacts, journey, when)
+    predicted, upper = _score(artifacts, row)
 
-    frame = pd.DataFrame([row])
-    for column, codes in artifacts.encoder_mapping.items():
-        if column in frame.columns:
-            frame[column] = (
-                frame[column].astype(str).map(codes).fillna(-1).astype("int32")
-            )
-
-    missing = [c for c in artifacts.columns if c not in frame.columns]
-    if missing:
-        raise ValueError(f"handler failed to produce required feature(s): {missing}")
-
-    matrix = frame[artifacts.columns]
-    predicted = float(artifacts.booster.predict(matrix)[0])
-
-    warnings: list[str] = []
     segments = journey["n_segments"]
-    support = _training_support(segments, artifacts.training_support)
-    if support is None:
-        warnings.append(
-            f"journey spans {segments} segments, beyond anything the model was trained "
-            "on; this prediction is extrapolated and unreliable"
-        )
-    elif support < MIN_TRAINING_SUPPORT:
-        warnings.append(
-            f"only {support:,} comparable training journeys near {segments} segments "
-            f"(under {MIN_TRAINING_SUPPORT:,}); treat this as weakly supported"
-        )
+    warnings = _support_warnings(artifacts, segments)
 
     if not np.isfinite(row.get("recent_deviation", np.nan)):
         warnings.append(
@@ -412,8 +483,7 @@ def _predict(payload: dict, artifacts: Artifacts) -> dict:
         )
 
     arrive_by: dict = {}
-    if artifacts.quantile_booster is not None:
-        upper = float(artifacts.quantile_booster.predict(matrix)[0])
+    if upper is not None:
         # Report the coverage this model ACHIEVED at this length, not the nominal 80%.
         # Measured: 80.2% at one segment falling to 62.3% at 28, because a single
         # quantile fitted across pooled lengths under-covers the long tail. Quoting the
@@ -434,6 +504,16 @@ def _predict(payload: dict, artifacts: Artifacts) -> dict:
         "predicted_sec": round(predicted, 1),
         **arrive_by,
         "predicted_min": round(predicted / 60, 2),
+        # A direct journey is entirely riding — no platform change, no connection to
+        # wait for. The zeros are reported rather than omitted so that every response
+        # carries the same breakdown and a caller never has to special-case which kind
+        # of journey came back.
+        "ride_sec": round(predicted, 1),
+        "ride_min": round(predicted / 60, 2),
+        "walk_sec": 0,
+        "walk_min": 0.0,
+        "wait_sec": 0,
+        "wait_min": 0.0,
         "scheduled_sec": journey["scheduled_total_sec"],
         "n_segments": journey["n_segments"],
         "origin": journey["origin_station"],
@@ -444,6 +524,239 @@ def _predict(payload: dict, artifacts: Artifacts) -> dict:
         "model_run": artifacts.run_id,
         # Surfaced on every response, not buried in a manifest: a caller must be able to
         # see that the split behind this number is provisional.
+        "trustworthy": artifacts.trustworthy,
+        "warnings": warnings,
+    }
+
+
+def _leg_journey(origin_stop_id: str, destination_stop_id: str, leg: dict) -> dict:
+    """Adapt a scheduled leg into the shape `_feature_row` expects."""
+    return {
+        "origin_stop_id": origin_stop_id,
+        "destination_stop_id": destination_stop_id,
+        "n_segments": int(leg["n_segments"]),
+        "scheduled_total_sec": int(leg["sched_sec"]),
+        "stops_spanned": int(leg["stop_span"]),
+        "route_id": leg["route_id"],
+        "direction_id": int(leg["direction_id"]),
+        "first_leg_to": leg["first_leg_to"],
+    }
+
+
+def _score_itinerary(
+    artifacts: Artifacts,
+    candidate,
+    when: pd.Timestamp,
+    depart_sec: int,
+    services: list[str],
+) -> dict | None:
+    """Predict both legs and time the connection between them.
+
+    The connection is timed against the **predicted** arrival, not the scheduled one.
+    That is the point of doing it this way round: if leg 1 is running late the model
+    says so, and the rider is shown the connection they will actually make rather than
+    the one the timetable promises.
+    """
+    graph = artifacts.graph
+    leg1 = _leg_journey(candidate.origin_stop_id, candidate.transfer_in, candidate.leg1)
+    row1 = _feature_row(artifacts, leg1, when)
+    ride1, upper1 = _score(artifacts, row1)
+
+    arrival_sec = depart_sec + int(round(ride1))
+    timing = graph.connection(candidate, arrival_sec, services)
+    if timing is None:
+        return None
+
+    # Leg 2 is predicted at the moment it is actually boarded. A long first leg can
+    # cross a fare period or a rush-hour boundary, and scoring it at the request's
+    # departure time would use the wrong hour-of-day features.
+    board = when + pd.Timedelta(int(timing["departure_sec"] - depart_sec), unit="s")
+    board_hour = board.tz_convert(SERVICE_TZ).hour
+    leg2_schedule = (
+        graph.leg(candidate.transfer_out, candidate.destination_stop_id, board_hour)
+        or candidate.leg2
+    )
+    leg2 = _leg_journey(
+        candidate.transfer_out, candidate.destination_stop_id, leg2_schedule
+    )
+    row2 = _feature_row(artifacts, leg2, board)
+    ride2, upper2 = _score(artifacts, row2)
+
+    walk = candidate.walk_sec
+    wait = timing["wait_sec"]
+    total = ride1 + walk + wait + ride2
+    upper = None if upper1 is None or upper2 is None else upper1 + walk + wait + upper2
+    return {
+        "candidate": candidate,
+        "timing": timing,
+        "ride_sec": ride1 + ride2,
+        "walk_sec": walk,
+        "wait_sec": wait,
+        "row1": row1,
+        "row2": row2,
+        "ride1": ride1,
+        "ride2": ride2,
+        "leg1": leg1,
+        "leg2": leg2,
+        "board": board,
+        "total_sec": total,
+        "arrive_by_sec": upper,
+        "scheduled_sec": int(
+            leg1["scheduled_total_sec"] + walk + wait + leg2["scheduled_total_sec"]
+        ),
+    }
+
+
+def _predict_transfer(
+    payload: dict, artifacts: Artifacts, when: pd.Timestamp, local_hour: int
+) -> dict:
+    """Compose a two-leg answer for a journey no single train covers."""
+    graph = artifacts.graph
+    origin_name = payload["origin"]
+    destination_name = payload["destination"]
+
+    local = when.tz_convert(SERVICE_TZ)
+    service_date, depart_sec = service_position(local)
+    services = graph.services_on(service_date)
+    if not services:
+        raise NoItineraryError(f"no scheduled service on {service_date}")
+
+    candidates = graph.candidates(origin_name, destination_name, local_hour)
+    if not candidates:
+        raise NoItineraryError(
+            f"no route from {origin_name!r} to {destination_name!r}, with or without "
+            "a train change"
+        )
+
+    shortlist = graph.rank(candidates, depart_sec, services)
+    if not shortlist:
+        raise NoItineraryError(
+            f"no connection from {origin_name!r} to {destination_name!r} is scheduled "
+            f"late enough on {service_date}; service has ended for the night"
+        )
+
+    scored = [
+        result
+        for result in (
+            _score_itinerary(artifacts, candidate, when, depart_sec, services)
+            for candidate, _ in shortlist
+        )
+        if result is not None
+    ]
+    if not scored:
+        raise NoItineraryError(
+            f"no connection could be timed from {origin_name!r} to "
+            f"{destination_name!r} at {when.isoformat()}"
+        )
+    best = min(scored, key=lambda result: result["total_sec"])
+
+    candidate = best["candidate"]
+    timing = best["timing"]
+    warnings: list[str] = []
+    for label, row, leg in (
+        ("first leg: ", best["row1"], best["leg1"]),
+        ("second leg: ", best["row2"], best["leg2"]),
+    ):
+        warnings.extend(_support_warnings(artifacts, leg["n_segments"], label))
+        if not np.isfinite(row.get("recent_deviation", np.nan)):
+            warnings.append(
+                f"{label}no traversal of the origin segment completed within the last "
+                "hour; recent-conditions features are null, so this leans on the "
+                "schedule"
+            )
+
+    if (
+        timing["if_missed_sec"] is not None
+        and timing["wait_sec"] < TIGHT_CONNECTION_SEC
+    ):
+        warnings.append(
+            f"tight connection: {timing['wait_sec']}s to change at "
+            f"{candidate.transfer_station}. Missing it costs "
+            f"{timing['if_missed_sec'] / 60:.0f} min waiting for the next train"
+        )
+
+    warnings.append(
+        "the connection is timed from the published timetable, so it assumes the "
+        "onward train departs on schedule"
+    )
+
+    arrive_by: dict = {}
+    if best["arrive_by_sec"] is not None:
+        arrive_by = {
+            "arrive_by_sec": round(best["arrive_by_sec"], 1),
+            "arrive_by_min": round(best["arrive_by_sec"] / 60, 2),
+            # Deliberately no coverage figure. Adding two p80 legs does NOT give the
+            # p80 of the total — it is more conservative than that, by an amount that
+            # depends on how correlated the legs are. Quoting 80% here would be a
+            # number this arithmetic does not support.
+            "arrive_by_basis": "sum of per-leg p80 estimates; conservative, not a "
+            "calibrated 80th percentile of the total",
+        }
+
+    total = best["total_sec"]
+    ride = best["ride_sec"]
+    walk = best["walk_sec"]
+    wait = best["wait_sec"]
+    legs = [
+        {
+            "type": "ride",
+            "from": _station_name(artifacts, candidate.origin_stop_id),
+            "to": _station_name(artifacts, candidate.transfer_in),
+            "from_stop_id": candidate.origin_stop_id,
+            "to_stop_id": candidate.transfer_in,
+            "line": best["leg1"]["route_id"],
+            "predicted_sec": round(best["ride1"], 1),
+            "scheduled_sec": best["leg1"]["scheduled_total_sec"],
+            "n_segments": best["leg1"]["n_segments"],
+        },
+        {
+            "type": "transfer",
+            "at": candidate.transfer_station,
+            "from_stop_id": candidate.transfer_in,
+            "to_stop_id": candidate.transfer_out,
+            "walk_sec": candidate.walk_sec,
+            "wait_sec": timing["wait_sec"],
+            "if_missed_sec": timing["if_missed_sec"],
+        },
+        {
+            "type": "ride",
+            "from": _station_name(artifacts, candidate.transfer_out),
+            "to": _station_name(artifacts, candidate.destination_stop_id),
+            "from_stop_id": candidate.transfer_out,
+            "to_stop_id": candidate.destination_stop_id,
+            "line": best["leg2"]["route_id"],
+            "predicted_sec": round(best["ride2"], 1),
+            "scheduled_sec": best["leg2"]["scheduled_total_sec"],
+            "n_segments": best["leg2"]["n_segments"],
+            "boards_at": best["board"].isoformat(),
+        },
+    ]
+
+    return {
+        "predicted_sec": round(total, 1),
+        **arrive_by,
+        "predicted_min": round(total / 60, 2),
+        # The four numbers a rider actually reasons about. `ride_sec` is time on
+        # trains only: it is the part the model predicts, and the part that does not
+        # change if they miss the connection.
+        "ride_sec": round(ride, 1),
+        "ride_min": round(ride / 60, 2),
+        "walk_sec": walk,
+        "walk_min": round(walk / 60, 2),
+        "wait_sec": wait,
+        "wait_min": round(wait / 60, 2),
+        "scheduled_sec": best["scheduled_sec"],
+        "n_segments": best["leg1"]["n_segments"] + best["leg2"]["n_segments"],
+        "transfers": 1,
+        "transfer_station": candidate.transfer_station,
+        "legs": legs,
+        "origin": _station_name(artifacts, candidate.origin_stop_id),
+        "destination": _station_name(artifacts, candidate.destination_stop_id),
+        "origin_stop_id": candidate.origin_stop_id,
+        "destination_stop_id": candidate.destination_stop_id,
+        "departure_ts": when.isoformat(),
+        "service_date": service_date,
+        "model_run": artifacts.run_id,
         "trustworthy": artifacts.trustworthy,
         "warnings": warnings,
     }

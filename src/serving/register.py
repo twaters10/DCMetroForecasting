@@ -94,6 +94,11 @@ def staged_serving_dir(destination: Path) -> Path:
     for source in (
         Path(SERVING_INPUTS) / "station_index.json",
         Path(SERVING_INPUTS) / "journey_schedule.csv",
+        # Routing: without these the container loads, but refuses every journey that
+        # needs a train change — which is 64% of the network.
+        Path(SERVING_INPUTS) / "walk_edges.csv",
+        Path(SERVING_INPUTS) / "departures.csv",
+        Path(SERVING_INPUTS) / "service_calendar.csv",
     ):
         if not source.exists():
             raise FileNotFoundError(
@@ -187,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         code_files={
             "inference.py": code_dir / "inference.py",
             "stations.py": code_dir / "stations.py",
+            "routing.py": code_dir / "routing.py",
             "requirements.txt": code_dir / "requirements.txt",
         },
     )

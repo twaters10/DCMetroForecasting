@@ -57,6 +57,93 @@ def predict(origin: str, destination: str, when) -> dict:
     return json.loads(response["Body"].read())
 
 
+def render_breakdown(result: dict) -> None:
+    """Split the total into riding, walking and waiting.
+
+    Riding is the part the model predicts and the part that does not change if the
+    rider misses their connection; waiting is the part that does. Separating them is
+    what makes a tight change legible instead of hidden inside one number.
+
+    A journey with no train change has no walk and no wait, so those read zero — shown
+    rather than hidden, so the three numbers always add up to the total on screen.
+    """
+    columns = st.columns(3)
+    columns[0].metric("On trains", f"{result.get('ride_min', 0):.0f} min")
+    columns[1].metric("Walking", _short(result.get("walk_sec", 0)))
+    columns[2].metric("Waiting", _short(result.get("wait_sec", 0)))
+
+
+def _short(seconds: float) -> str:
+    """Seconds below a minute, minutes to one decimal above it.
+
+    One decimal, not a whole number: these are small quantities, and rounding a
+    3.5-minute wait to "4 min" both loses the precision and disagrees with the leg
+    detail below, which shows the same wait as 3.5.
+    """
+    seconds = int(round(seconds))
+    if seconds == 0:
+        return "none"
+    if seconds < 60:
+        return f"{seconds}s"
+    return f"{seconds / 60:.1f} min"
+
+
+def render_legs(result: dict) -> None:
+    """Show a transfer journey leg by leg, with the time on each leg.
+
+    Per leg, not just a combined riding total: "57 minutes on trains" does not tell a
+    rider whether that is one long haul and one short hop or an even split, and the
+    two feel completely different to sit through. Each leg is also the unit the model
+    actually predicts, so a leg is the smallest thing that can be checked against the
+    timetable.
+
+    The wait is broken out for the opposite reason — it is the least certain part of
+    the estimate, and `if_missed_sec` is what makes a tight change a judgement the
+    rider can make rather than a risk hidden inside a total.
+    """
+    legs = result.get("legs")
+    if not legs:
+        return
+
+    transfers = result.get("transfers", 0)
+    heading = (
+        f"**1 train change** · via {result.get('transfer_station', '?')}"
+        if transfers == 1
+        else f"**{transfers} train changes**"
+    )
+    st.markdown(heading)
+
+    ride_number = 0
+    for leg in legs:
+        if leg["type"] == "ride":
+            ride_number += 1
+            minutes = leg["predicted_sec"] / 60
+            scheduled = leg["scheduled_sec"] / 60
+            st.markdown(
+                f"🚆 **Leg {ride_number}: {leg['from']} → {leg['to']}** — "
+                f"**{minutes:.1f} min**"
+            )
+            st.caption(
+                f"{leg['line'].title()} line · {leg['n_segments']} stops · "
+                f"timetable {scheduled:.0f} min ({minutes - scheduled:+.1f})"
+            )
+        else:
+            walk = leg["walk_sec"]
+            wait = leg["wait_sec"] / 60
+            where = (
+                f"{walk}s walk between platforms" if walk else "no walk, same platform"
+            )
+            st.markdown(f"⇄ **Change at {leg['at']}** — **{wait:.1f} min wait**")
+            missed = leg.get("if_missed_sec")
+            note = f"{where}"
+            if missed is not None:
+                note += (
+                    f" · miss it and the next train is {missed / 60:.0f} min "
+                    "from when you reach the platform"
+                )
+            st.caption(note)
+
+
 def main() -> None:
     st.set_page_config(page_title="Metro Pulse", page_icon="🚇", layout="centered")
     st.title("🚇 How long will my trip take?")
@@ -116,6 +203,11 @@ def main() -> None:
             f"“Budget for” is the estimate {coverage:.0f}% of these journeys finish "
             "within — measured, not assumed."
         )
+    elif result.get("arrive_by_basis"):
+        st.caption(f"“Budget for” is the {result['arrive_by_basis']}.")
+
+    render_breakdown(result)
+    render_legs(result)
 
     st.caption(
         f"{result['n_segments']} segments · "

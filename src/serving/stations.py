@@ -326,6 +326,20 @@ def main(argv: list[str] | None = None) -> int:
     index = build_station_index(stops)
     schedule = build_journey_schedule(stop_times)
 
+    # Imported here, not at module scope: `routing` imports this module, so a top-level
+    # import would be circular.
+    from .routing import (
+        build_departures,
+        build_service_calendar,
+        build_walk_edges,
+        read_bundle_tables,
+    )
+
+    tables = read_bundle_tables(bundle)
+    walk_edges = build_walk_edges(tables["pathways.txt"], index)
+    departures = build_departures(stop_times, tables["trips.txt"], index)
+    calendar = build_service_calendar(tables["calendar_dates.txt"])
+
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     (output / "station_index.json").write_text(index.to_json())
@@ -334,7 +348,14 @@ def main(argv: list[str] | None = None) -> int:
     # 5.5 MB, all of it downloaded and installed at every serverless cold start. A ~5 MB
     # CSV that pandas reads natively removes the dependency entirely.
     schedule.to_csv(output / "journey_schedule.csv", index=False)
-    logger.info("wrote station_index.json and journey_schedule.csv to %s", output)
+    walk_edges.to_csv(output / "walk_edges.csv", index=False)
+    departures.to_csv(output / "departures.csv", index=False)
+    calendar.to_csv(output / "service_calendar.csv", index=False)
+    logger.info(
+        "wrote station_index.json, journey_schedule.csv and 3 routing "
+        "artifact(s) to %s",
+        output,
+    )
     return 0
 
 
