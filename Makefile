@@ -48,6 +48,9 @@ train:
 # but a stale one would be accepted silently after a timetable rollover.
 publish:
 	$(PY) -m src.serving.stations
+	# Map geometry for the dashboard. Local only -- it is not packaged into
+	# model.tar.gz, because the inference container has no use for coordinates.
+	$(PY) -m src.serving.geometry
 	AWS_PROFILE=$(PROFILE) $(PY) -m src.serving.publish
 
 retrain: etl features train publish register-hint

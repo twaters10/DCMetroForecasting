@@ -17,10 +17,20 @@ same confidence would undo the work that produced those caveats.
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
 import streamlit as st
+
+# Streamlit executes this file as a TOP-LEVEL SCRIPT, where there is no parent package
+# and a relative import raises "attempted relative import with no known parent package".
+# The tests import it as `src.ui.app`, where the relative form is the one that works.
+# Same dual-context problem as `src/serving/inference.py`, same shape of answer.
+try:  # package context: tests, `python -m`
+    from . import route_map
+except ImportError:  # script context: `streamlit run src/ui/app.py`
+    import route_map  # type: ignore[no-redef]
 
 ENDPOINT = "metro-pulse-journey"
 REGION = "us-east-1"
@@ -55,6 +65,122 @@ def predict(origin: str, destination: str, when) -> dict:
         Body=json.dumps(payload),
     )
     return json.loads(response["Body"].read())
+
+
+def _dark_theme() -> bool:
+    """Best effort. A wrong guess costs a slightly off halo colour, not a broken map."""
+    try:
+        return str(st.get_option("theme.base")).lower() == "dark"
+    except Exception:  # noqa: BLE001 - option access varies across Streamlit versions
+        return False
+
+
+def _map_payload(result: dict | None) -> dict:
+    """Only the fields the map actually draws.
+
+    Used as the cache key as well as the input, so a rerun that leaves the route alone
+    is a cache hit even though the surrounding prediction carries timestamps and
+    floats that change on every call.
+    """
+    if not result or "error" in result:
+        return {}
+    return {
+        "line": result.get("line"),
+        "origin_stop_id": result.get("origin_stop_id"),
+        "destination_stop_id": result.get("destination_stop_id"),
+        "origin": result.get("origin", ""),
+        "destination": result.get("destination", ""),
+        "legs": [
+            {
+                k: leg.get(k)
+                for k in ("type", "line", "from_stop_id", "to_stop_id", "at")
+            }
+            for leg in result.get("legs", [])
+        ],
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _map_png(payload_json: str, dark: bool) -> bytes | None:
+    """Render to PNG bytes rather than returning a figure.
+
+    Streamlit re-executes the whole script on every widget interaction, and a warm
+    render costs ~50 ms (the first ~650 ms, mostly matplotlib's font cache). Caching
+    the bytes makes an unchanged route free. `st.cache_data` cannot hold a Matplotlib
+    figure sensibly, and closing the figure in here is also what stops a long session
+    accumulating open figures.
+    """
+    import matplotlib.pyplot as plt
+
+    figure = route_map.render(json.loads(payload_json), dark=dark)
+    if figure is None:
+        return None
+    buffer = io.BytesIO()
+    figure.savefig(buffer, format="png", dpi=150, transparent=True, bbox_inches="tight")
+    plt.close(figure)
+    return buffer.getvalue()
+
+
+def render_map_panel(result: dict | None) -> None:
+    """The right-hand map. Always drawn, with or without a route.
+
+    Before the first prediction this shows the bare network — `route_map.render({})`
+    skips the highlight, the labels and the zoom-to-route, leaving the whole system on
+    screen. That is deliberate: the panel should not be an empty rectangle on load, and
+    drawing it costs nothing because no endpoint call is involved.
+    """
+    st.markdown("##### Route")
+
+    payload, caption = _map_payload(result), ""
+    alternative = (result or {}).get("alternative")
+
+    if alternative:
+        # One map, two routes, same frame — which is the only way to see that the
+        # direct ride goes the long way round.
+        direct_label = f"Direct · {result['predicted_min']:.0f} min"
+        alt_label = (
+            f"Via {alternative['transfer_station']} · "
+            f"{alternative['predicted_min']:.0f} min"
+        )
+        choice = st.segmented_control(
+            "Route shown",
+            [direct_label, alt_label],
+            default=direct_label,
+            label_visibility="collapsed",
+        )
+        if choice == alt_label:
+            payload = _map_payload(
+                {
+                    **alternative,
+                    "origin": result["origin"],
+                    "destination": result["destination"],
+                }
+            )
+            caption = (
+                f"{alternative['n_segments']} stops, changing at "
+                f"{alternative['transfer_station']}"
+            )
+        else:
+            caption = f"{result['n_segments']} stops, no change of train"
+
+    elif result and "error" not in result:
+        caption = (
+            f"{result['origin']} → {result['destination']} · "
+            f"{result['n_segments']} stops"
+        )
+    else:
+        caption = "The whole network. Pick a trip and the route appears here."
+
+    png = _map_png(json.dumps(payload, sort_keys=True), _dark_theme())
+    if png is None:
+        st.info(
+            "Map unavailable — run `python -m src.serving.geometry` to build "
+            "`network_geometry.json`.",
+            icon="🗺️",
+        )
+        return
+    st.image(png, width="stretch")
+    st.caption(caption + " · faded lines are the rest of the network")
 
 
 def render_breakdown(result: dict) -> None:
@@ -144,45 +270,51 @@ def render_legs(result: dict) -> None:
             st.caption(note)
 
 
-def main() -> None:
-    st.set_page_config(page_title="Metro Pulse", page_icon="🚇", layout="centered")
-    st.title("🚇 How long will my trip take?")
-    st.caption("WMATA rail journey times, from a self-built archive of the live feeds.")
+def render_alternative(result: dict) -> None:
+    """Show a faster transfer route alongside a direct answer, without replacing it.
 
-    names = station_names()
-    left, right = st.columns(2)
-    origin = left.selectbox(
-        "From", names, index=names.index("Vienna") if "Vienna" in names else 0
-    )
-    destination = right.selectbox(
-        "To", names, index=names.index("Rosslyn") if "Rosslyn" in names else 1
-    )
-
-    use_now = st.checkbox("Leaving now", value=True)
-    when = None
-    if not use_now:
-        import datetime as dt
-
-        date = st.date_input("Date", dt.date.today())
-        time = st.time_input("Departure time", dt.time(9, 0))
-        when = dt.datetime.combine(date, time, tzinfo=dt.UTC)
-
-    if not st.button("Predict", type="primary", use_container_width=True):
+    The direct ride stays the headline. A rider who would rather stay in their seat
+    should not have that decision made for them by two minutes of arithmetic — but
+    they should be told the option exists, because the app cannot tell which they
+    would prefer and the timetable alone does not make it obvious.
+    """
+    alternative = result.get("alternative")
+    if not alternative:
         return
 
+    st.divider()
+    st.markdown(
+        f"#### Faster if you change trains — {alternative['predicted_min']:.0f} min, "
+        f"saving about {alternative['saving_min']:.0f}"
+    )
+    st.caption(
+        f"The direct train takes {result['predicted_min']:.0f} min because of the "
+        f"route it follows. Changing at {alternative['transfer_station']} covers "
+        f"{alternative['n_segments']} stops instead of {result['n_segments']}."
+    )
+    render_legs(alternative)
+    st.caption("Use the toggle above the map to see this route drawn.")
+
+
+def _run_prediction(origin: str, destination: str, when) -> dict:
+    """Call the endpoint, returning a dict that may carry an `error` key.
+
+    Failures are values rather than exceptions so the caller can store one in session
+    state and keep rendering the page around it — including the map, which should not
+    vanish because a station name was ambiguous.
+    """
     if origin == destination:
-        st.warning("Origin and destination are the same.")
-        return
+        return {"error": "Origin and destination are the same."}
+    try:
+        return predict(origin, destination, when)
+    except Exception as error:  # noqa: BLE001 - surface it, do not crash the app
+        return {"error": f"Could not reach the endpoint: {error}"}
 
-    with st.spinner("Asking the model…"):
-        try:
-            result = predict(origin, destination, when)
-        except Exception as error:  # noqa: BLE001 - surface it, do not crash the app
-            st.error(f"Could not reach the endpoint: {error}")
-            return
 
+def render_result(result: dict) -> None:
+    """The left column below the controls: the numbers, the legs, the caveats."""
     # A refusal is a real answer, not a failure. The resolver declines rather than
-    # guessing a platform, and journeys needing a transfer have no single-train answer.
+    # guessing a platform, and an unreachable name has no prediction to give.
     if "error" in result:
         st.warning(result["error"])
         return
@@ -208,6 +340,7 @@ def main() -> None:
 
     render_breakdown(result)
     render_legs(result)
+    render_alternative(result)
 
     st.caption(
         f"{result['n_segments']} segments · "
@@ -227,6 +360,49 @@ def main() -> None:
 
     with st.expander("Raw response"):
         st.json(result)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Metro Pulse", page_icon="🚇", layout="wide")
+    st.title("🚇 How long will my trip take?")
+    st.caption("WMATA rail journey times, from a self-built archive of the live feeds.")
+
+    controls, mapping = st.columns([5, 6], gap="large")
+
+    with controls:
+        names = station_names()
+        from_column, to_column = st.columns(2)
+        origin = from_column.selectbox(
+            "From", names, index=names.index("Vienna") if "Vienna" in names else 0
+        )
+        destination = to_column.selectbox(
+            "To", names, index=names.index("Rosslyn") if "Rosslyn" in names else 1
+        )
+
+        use_now = st.checkbox("Leaving now", value=True)
+        when = None
+        if not use_now:
+            import datetime as dt
+
+            date = st.date_input("Date", dt.date.today())
+            time = st.time_input("Departure time", dt.time(9, 0))
+            when = dt.datetime.combine(date, time, tzinfo=dt.UTC)
+
+        # The result lives in session state because Streamlit re-runs this whole script
+        # on EVERY widget interaction. Held in a local, it would be lost the moment the
+        # departure time changed, blanking the map for an edit that did not touch it.
+        if st.button("Predict", type="primary", width="stretch"):
+            with st.spinner("Asking the model…"):
+                st.session_state["result"] = _run_prediction(origin, destination, when)
+
+        result = st.session_state.get("result")
+        if result is not None:
+            render_result(result)
+
+    with mapping:
+        # Rendered unconditionally, before any prediction exists. Every branch above
+        # used to `return` early, which would now take the map down with it.
+        render_map_panel(st.session_state.get("result"))
 
 
 if __name__ == "__main__":

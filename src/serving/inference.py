@@ -84,6 +84,11 @@ MIN_TRAINING_SUPPORT = 1000
 # full headway.
 TIGHT_CONNECTION_SEC = 60
 
+# How much faster a transfer must be before it is worth mentioning next to a one-train
+# answer. Two minutes: below that the saving is inside the model's own error at these
+# lengths, so "change trains to save 40 seconds" is advice the numbers cannot support.
+ALTERNATIVE_MIN_SAVING_SEC = 120
+
 # Fallback only, for a manifest written before per-length support was recorded.
 FALLBACK_MAX_SEGMENTS = 17
 
@@ -500,7 +505,7 @@ def _predict_direct(
                 f"{segments} segments, not the nominal 80%"
             )
 
-    return {
+    result = {
         "predicted_sec": round(predicted, 1),
         **arrive_by,
         "predicted_min": round(predicted / 60, 2),
@@ -516,6 +521,10 @@ def _predict_direct(
         "wait_min": 0.0,
         "scheduled_sec": journey["scheduled_total_sec"],
         "n_segments": journey["n_segments"],
+        # Which train to actually board. Absent until now because a direct journey has
+        # exactly one, so it felt implied — but the map has to draw it, and a rider
+        # standing on a platform has the same question.
+        "line": journey["route_id"],
         "origin": journey["origin_station"],
         "destination": journey["destination_station"],
         "origin_stop_id": journey["origin_stop_id"],
@@ -527,6 +536,19 @@ def _predict_direct(
         "trustworthy": artifacts.trustworthy,
         "warnings": warnings,
     }
+
+    # Attached only when a transfer genuinely beats this ride. The key is ABSENT rather
+    # than null otherwise, so a direct answer with no better option is unchanged from
+    # before this existed.
+    alternative = _faster_alternative(payload, artifacts, when, local_hour, result)
+    if alternative is not None:
+        result["alternative"] = alternative
+        result["warnings"] = [
+            *warnings,
+            f"a change at {alternative['transfer_station']} is about "
+            f"{alternative['saving_min']:.0f} min faster than staying on this train",
+        ]
+    return result
 
 
 def _leg_journey(origin_stop_id: str, destination_stop_id: str, leg: dict) -> dict:
@@ -604,6 +626,143 @@ def _score_itinerary(
         "scheduled_sec": int(
             leg1["scheduled_total_sec"] + walk + wait + leg2["scheduled_total_sec"]
         ),
+    }
+
+
+def _itinerary_legs(artifacts: Artifacts, best: dict) -> list[dict]:
+    """Ride / transfer / ride, in the order they are travelled."""
+    candidate = best["candidate"]
+    timing = best["timing"]
+    return [
+        {
+            "type": "ride",
+            "from": _station_name(artifacts, candidate.origin_stop_id),
+            "to": _station_name(artifacts, candidate.transfer_in),
+            "from_stop_id": candidate.origin_stop_id,
+            "to_stop_id": candidate.transfer_in,
+            "line": best["leg1"]["route_id"],
+            "predicted_sec": round(best["ride1"], 1),
+            "scheduled_sec": best["leg1"]["scheduled_total_sec"],
+            "n_segments": best["leg1"]["n_segments"],
+        },
+        {
+            "type": "transfer",
+            "at": candidate.transfer_station,
+            "from_stop_id": candidate.transfer_in,
+            "to_stop_id": candidate.transfer_out,
+            "walk_sec": candidate.walk_sec,
+            "wait_sec": timing["wait_sec"],
+            "if_missed_sec": timing["if_missed_sec"],
+        },
+        {
+            "type": "ride",
+            "from": _station_name(artifacts, candidate.transfer_out),
+            "to": _station_name(artifacts, candidate.destination_stop_id),
+            "from_stop_id": candidate.transfer_out,
+            "to_stop_id": candidate.destination_stop_id,
+            "line": best["leg2"]["route_id"],
+            "predicted_sec": round(best["ride2"], 1),
+            "scheduled_sec": best["leg2"]["scheduled_total_sec"],
+            "n_segments": best["leg2"]["n_segments"],
+            "boards_at": best["board"].isoformat(),
+        },
+    ]
+
+
+def _faster_alternative(
+    payload: dict,
+    artifacts: Artifacts,
+    when: pd.Timestamp,
+    local_hour: int,
+    direct: dict,
+) -> dict | None:
+    """A transfer worth mentioning beside a one-train answer, or None.
+
+    **A direct ride is not automatically the quickest one.** The Blue line reaches
+    Eastern Market from Potomac Yard with no change at all, but it travels via
+    Rosslyn: 16 segments and 30 minutes, against 8 segments and 23.5 for Yellow to
+    L'Enfant Plaza and a change there. Answering "there is a direct train" is true and
+    unhelpful.
+
+    Measured over the whole network, a transfer beats the direct ride on 165 of 3,220
+    connected pairs — 110 of them by more than five minutes — concentrated in the
+    Virginia Blue-line stations where that Rosslyn detour costs the most.
+
+    The direct route stays the answer. This only adds the alternative next to it, so a
+    rider who would rather stay seated is not overruled by two minutes of arithmetic.
+    """
+    graph = artifacts.graph
+    if graph is None:
+        return None
+
+    local = when.tz_convert(SERVICE_TZ)
+    service_date, depart_sec = service_position(local)
+    services = graph.services_on(service_date)
+    if not services:
+        return None
+
+    try:
+        candidates = graph.candidates(
+            payload["origin"], payload["destination"], local_hour
+        )
+    except StationError:
+        # An ambiguous or unknown name is the direct answer's problem to report, not a
+        # reason to fail the whole response over an optional extra.
+        return None
+    if not candidates:
+        return None
+
+    # Prune on the TIMETABLE before spending any model calls. Scoring an itinerary
+    # costs two predictions, and on 95% of pairs no transfer is close to competitive.
+    shortlist = [
+        (candidate, timing)
+        for candidate, timing in graph.rank(candidates, depart_sec, services)
+        if (
+            int(candidate.leg1["sched_sec"])
+            + candidate.walk_sec
+            + timing["wait_sec"]
+            + int(candidate.leg2["sched_sec"])
+        )
+        <= direct["scheduled_sec"] - ALTERNATIVE_MIN_SAVING_SEC
+    ]
+    if not shortlist:
+        return None
+
+    scored = [
+        result
+        for result in (
+            _score_itinerary(artifacts, candidate, when, depart_sec, services)
+            for candidate, _ in shortlist
+        )
+        if result is not None
+    ]
+    if not scored:
+        return None
+    best = min(scored, key=lambda result: result["total_sec"])
+
+    # Re-checked against the PREDICTION, not the timetable that got it shortlisted. A
+    # route the schedule likes can lose once the model has seen how the lines actually
+    # run, and recommending it then would be worse than saying nothing.
+    saving = direct["predicted_sec"] - best["total_sec"]
+    if saving < ALTERNATIVE_MIN_SAVING_SEC:
+        return None
+
+    candidate = best["candidate"]
+    return {
+        "reason": "faster with one train change",
+        "saving_sec": round(saving, 1),
+        "saving_min": round(saving / 60, 2),
+        "predicted_sec": round(best["total_sec"], 1),
+        "predicted_min": round(best["total_sec"] / 60, 2),
+        "ride_sec": round(best["ride_sec"], 1),
+        "ride_min": round(best["ride_sec"] / 60, 2),
+        "walk_sec": best["walk_sec"],
+        "wait_sec": best["wait_sec"],
+        "scheduled_sec": best["scheduled_sec"],
+        "n_segments": best["leg1"]["n_segments"] + best["leg2"]["n_segments"],
+        "transfers": 1,
+        "transfer_station": candidate.transfer_station,
+        "legs": _itinerary_legs(artifacts, best),
     }
 
 
@@ -697,40 +856,7 @@ def _predict_transfer(
     ride = best["ride_sec"]
     walk = best["walk_sec"]
     wait = best["wait_sec"]
-    legs = [
-        {
-            "type": "ride",
-            "from": _station_name(artifacts, candidate.origin_stop_id),
-            "to": _station_name(artifacts, candidate.transfer_in),
-            "from_stop_id": candidate.origin_stop_id,
-            "to_stop_id": candidate.transfer_in,
-            "line": best["leg1"]["route_id"],
-            "predicted_sec": round(best["ride1"], 1),
-            "scheduled_sec": best["leg1"]["scheduled_total_sec"],
-            "n_segments": best["leg1"]["n_segments"],
-        },
-        {
-            "type": "transfer",
-            "at": candidate.transfer_station,
-            "from_stop_id": candidate.transfer_in,
-            "to_stop_id": candidate.transfer_out,
-            "walk_sec": candidate.walk_sec,
-            "wait_sec": timing["wait_sec"],
-            "if_missed_sec": timing["if_missed_sec"],
-        },
-        {
-            "type": "ride",
-            "from": _station_name(artifacts, candidate.transfer_out),
-            "to": _station_name(artifacts, candidate.destination_stop_id),
-            "from_stop_id": candidate.transfer_out,
-            "to_stop_id": candidate.destination_stop_id,
-            "line": best["leg2"]["route_id"],
-            "predicted_sec": round(best["ride2"], 1),
-            "scheduled_sec": best["leg2"]["scheduled_total_sec"],
-            "n_segments": best["leg2"]["n_segments"],
-            "boards_at": best["board"].isoformat(),
-        },
-    ]
+    legs = _itinerary_legs(artifacts, best)
 
     return {
         "predicted_sec": round(total, 1),
