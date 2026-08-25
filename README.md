@@ -78,11 +78,32 @@ for why the schedule join keys on `scheduled_trip_id`.
 
 ### Unattended
 
-A GitHub Actions workflow ([`.github/workflows/etl-daily.yml`](.github/workflows/etl-daily.yml))
-runs `src.etl.catchup` daily at 07:00 UTC. It processes every *complete* service day
-missing from S3 rather than "yesterday", so a skipped or delayed run costs nothing and
-the next one catches up. One-time AWS OIDC setup is in
-[`docs/ci-setup.md`](docs/ci-setup.md).
+A cron entry on this machine runs `src.etl.catchup` four times a day — 09:00, 13:00,
+17:00 and 21:00 local. It processes every *complete* service day missing from S3 rather
+than "yesterday", so a skipped or delayed run costs nothing and the next one catches up.
+
+```bash
+make install-cron     # (re)install the schedule
+make cron-log         # tail the scheduled run log
+make uninstall-cron
+```
+
+Four firings rather than one because cron, unlike launchd, does not catch up a run
+missed while the laptop was asleep — and a no-op run costs about three seconds.
+
+The launcher is installed to `~/.metro-pulse/run-etl.sh`, deliberately **outside**
+`~/Documents`. macOS TCC grants filesystem access per *binary*: `/bin/bash` is denied
+everything under `~/Documents`, so cron cannot read a launcher stored in this repo, but
+`.venv/bin/python` resolves to `/Library/Frameworks/Python.framework`, which holds Full
+Disk Access and reads the repo fine. The launcher therefore hands every repo path to
+Python and none to the shell, and writes its log to `~/Library/Logs/metro-pulse` because
+the shell performs that redirect. `scripts/etl_cron.sh` is the source of truth; re-run
+`make install-cron` after editing it.
+
+The GitHub Actions workflow
+([`.github/workflows/etl-daily.yml`](.github/workflows/etl-daily.yml)) is kept for
+on-demand `workflow_dispatch` runs from a machine that is not this laptop. Its schedule
+has been removed. One-time AWS OIDC setup is in [`docs/ci-setup.md`](docs/ci-setup.md).
 
 Locally, whenever you want:
 
@@ -91,10 +112,9 @@ Locally, whenever you want:
 ./scripts/run_etl_daily.sh             # process it, then sync to S3
 ```
 
-The wrapper sets `AWS_PROFILE` and `JAVA_HOME` itself, so nothing needs exporting.
-A local `launchd` schedule is *not* used — macOS TCC blocks a LaunchAgent from reading
-anything under `~/Documents`, so it cannot execute the pipeline at all
-([`docs/ci-setup.md`](docs/ci-setup.md) has the detail).
+The wrapper sets `AWS_PROFILE` and `JAVA_HOME` itself, so nothing needs exporting. It is
+for **interactive** use — a terminal holds Documents access, so it can read itself. cron
+cannot, which is why the scheduled path uses a separate installed launcher.
 
 ### Reading the segment table
 

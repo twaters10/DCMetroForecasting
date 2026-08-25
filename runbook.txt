@@ -263,7 +263,7 @@
 
 
 ================================================================================
- 5A. AUTOMATED OPERATION (GitHub Actions)
+ 5A. AUTOMATED OPERATION (local cron)
 ================================================================================
 
  The scheduled job is `src.etl.catchup`, not the pipeline directly, and it is
@@ -277,46 +277,93 @@
    - Dates the archive cannot fully cover are never proposed, including the
      collector's first partial day.
 
- WHERE IT RUNS: GitHub Actions, .github/workflows/etl-daily.yml, 07:00 UTC daily
- plus manual workflow_dispatch. One-time AWS OIDC and repo-variable setup is in
- docs/ci-setup.md.
+ WHERE IT RUNS: cron on this laptop, four times a day at 09:00, 13:00, 17:00
+ and 21:00 local. Install or reinstall with `make install-cron`. The crontab
+ entry points at ~/.metro-pulse/run-etl.sh, which is a COPY of
+ scripts/etl_cron.sh living outside ~/Documents.
 
- WHY NOT A LOCAL SCHEDULE: a launchd agent was built and does not work here.
- macOS TCC denies a LaunchAgent read access under ~/Documents, where this repo
- lives, so the job fails with exit 126 "Operation not permitted" before it
- starts. Probed: chdir and stat are allowed, listing and reading contents are
- not. The alternatives were moving the repo out of ~/Documents or granting Full
- Disk Access to /bin/bash; CI was chosen instead and also removes the
- laptop-asleep failure mode. Full detail in docs/ci-setup.md.
+ WHY THE LAUNCHER IS A COPY OUTSIDE THE REPO: macOS TCC grants filesystem
+ access per BINARY. Measured from cron on 2026-08-25:
+
+     ls / head / bash  reading the repo   ->  Operation not permitted
+     .venv/bin/python  reading the same   ->  OK, listed 24 entries
+
+ .venv/bin/python resolves to /Library/Frameworks/Python.framework, which holds
+ Full Disk Access; /bin/bash does not. So cron can RUN the pipeline but cannot
+ READ a shell script stored in the repo to find out how. The launcher therefore
+ sits outside ~/Documents and hands every repo path to Python, never to the
+ shell. Its log goes to ~/Library/Logs/metro-pulse for the same reason -- the
+ shell performs that redirect.
+
+ An earlier version of this section said a local schedule was impossible here.
+ That was measured with a launchd agent driving /bin/bash and generalised too
+ far: the per-binary nature of the grant was never tested. GitHub Actions ran
+ the schedule until 2026-08-25.
+
+ WHY FOUR FIRINGS AND NOT ONE: cron does not catch up a run missed while the
+ laptop slept. Four chances to find the machine awake, and a no-op run costs
+ about three seconds.
 
  5A.1  Check on it
 
-   GitHub -> Actions -> etl-daily. Green with "nothing outstanding" is a healthy
-   run, not a failure: the current service day has not closed yet.
+   make cron-log            # tail this month's log
+   crontab -l               # is the entry still installed?
+
+   A run ending "processed 0, failed 0", or one reporting nothing outstanding,
+   is healthy rather than a failure: the current service day has not closed yet.
 
  5A.2  Force a run
 
-   Actions -> etl-daily -> Run workflow. Inputs: mode, lookback_days, force.
+   ~/.metro-pulse/run-etl.sh --dry-run    # say what would run, change nothing
+   ~/.metro-pulse/run-etl.sh              # process what is outstanding
+
+   Or interactively from the repo: ./scripts/run_etl_daily.sh
 
  5A.3  Logs
 
-   The Actions run log is the primary record. The same output is also uploaded
-   as an `etl-log-<run_id>` artifact, retained 30 days.
+   ~/Library/Logs/metro-pulse/etl-<YYYY-MM>.log -- one file per month, appended,
+   never rotated automatically. Interactive runs of scripts/run_etl_daily.sh
+   write to ./logs/ in the repo instead, so the two paths do not interleave.
 
  5A.4  Reprocess a date after changing derivation logic
 
-   Run the workflow with force = true, or delete the partition and let the next
+   ~/.metro-pulse/run-etl.sh --force, or delete the partition and let the next
    run pick it up:
 
    aws s3 rm s3://<bucket>/processed/segments/service_date=2026-08-05/ --recursive
 
  5A.5  !! THE MOST LIKELY WAY THIS DIES
 
-   GitHub DISABLES scheduled workflows after 60 days of repository inactivity,
-   silently, with no notification. For a project that goes quiet between pushes
-   this is the realistic failure mode. Check the Actions tab monthly, or push
-   something occasionally. Recovery is re-enabling and running once - but only
-   while the source data is still inside its 90-day retention.
+   The venv gets rebuilt against a different interpreter -- Homebrew python,
+   pyenv, a plain `python -m venv` -- and the new binary does not carry Full
+   Disk Access. cron can then no longer read the repo at all, and nothing about
+   the resulting error mentions permissions unless you know to look.
+
+   The launcher checks for exactly this before doing any work, and on failure
+   writes to the log
+
+     FATAL: <python> cannot read <repo>
+
+   with the interpreter path spelled out, then exits 78 (EX_CONFIG). Fix by
+   granting Full Disk Access to the interpreter .venv/bin/python points at
+   (System Settings -> Privacy & Security -> Full Disk Access), or by rebuilding
+   the venv against /Library/Frameworks/Python.framework.
+
+   Runner-up: the laptop stays closed for a week. Not an incident -- catch-up
+   absorbs it -- until raw/ retention starts expiring the source data at 90 days.
+
+ 5A.6  Fallback: run it in CI
+
+   .github/workflows/etl-daily.yml still exists, via
+   Actions -> etl-daily -> Run workflow. Its schedule was removed on 2026-08-25.
+
+   The scheduled runs had been failing since the UI was added: streamlit
+   requires pyarrow!=25.0.0 and requirements-dev.txt pinned exactly 25.0.0, so
+   dependency installation died before the ETL started. The venv already had
+   25.0.1, so only CI -- which resolves from scratch -- ever hit it. Fixed by
+   pinning 25.0.1; re-check with
+
+     pip install --dry-run --ignore-installed -r requirements-dev.txt
 
 
 ================================================================================
@@ -421,10 +468,26 @@
            session only to fail on missing input.
  CHECK     python -m pytest tests/test_etl.py -k before_the_archive
 
- SYMPTOM   The scheduled workflow stopped running entirely
- CAUSE     GitHub disables scheduled workflows after 60 days of repo inactivity.
- CHECK     GitHub -> Actions -> etl-daily. A disabled schedule says so at the top.
- FIX       Re-enable it, then run once manually to catch up.
+ SYMPTOM   The scheduled ETL stopped running entirely
+ CAUSE 1   The cron entry is gone (crontab edited, user account migrated).
+ CHECK     crontab -l | grep run-etl
+ FIX       make install-cron
+
+ CAUSE 2   The venv was rebuilt against an interpreter without Full Disk
+           Access, so cron can no longer read ~/Documents. See 5A.5.
+ CHECK     make cron-log | grep FATAL     # the launcher says so explicitly
+ FIX       Grant Full Disk Access to the interpreter .venv/bin/python points
+           at, or rebuild the venv against /Library/Frameworks/Python.framework.
+
+ CAUSE 3   The laptop was asleep at every firing. Not an incident: the next run
+           catches up. Only a problem if it approaches raw/ 90-day retention.
+ CHECK     make cron-log                  # gaps between "cron run started" lines
+
+ SYMPTOM   The log has not been written at all since some date
+ CAUSE     cron itself is not running, or the launcher was deleted.
+ CHECK     pgrep -x cron ; ls -l ~/.metro-pulse/run-etl.sh
+ FIX       make install-cron recreates the launcher. If cron is not running,
+           reboot or `sudo launchctl kickstart -k system/com.vix.cron`.
 
  SYMPTOM   IAM rejects a policy while CREATING the role ("Unsupported Principal"
            / "Missing Resource")

@@ -4,27 +4,43 @@ One-time setup for `.github/workflows/etl-daily.yml`. Everything here is AWS con
 or GitHub settings work — none of it can be scripted from the repo, which is why it
 lives in a document rather than a Makefile.
 
-## Why CI rather than a laptop schedule
+> **The daily schedule no longer runs here.** As of 2026-08-25 it runs from cron on the
+> laptop — see `runbook.txt` §5A and `scripts/install_etl_cron.sh`. This workflow is
+> kept for on-demand `workflow_dispatch` runs from another machine, and the setup below
+> is what makes those work. It also **will not install as-is**: see "Why this stopped
+> working" at the bottom.
 
-A local `launchd` agent was built first and does not work. macOS TCC denies a
-LaunchAgent read access to anything under `~/Documents`, where this repo lives, so
-executing the pipeline fails before it starts:
+## Why this document used to say a laptop schedule was impossible
+
+It said this, and it was wrong:
+
+> A local `launchd` agent was built first and does not work. macOS TCC denies a
+> LaunchAgent read access to anything under `~/Documents` [...] Pointing the job
+> straight at `.venv/bin/python` does not help either: Python would then need to read
+> `src/etl/*.py`, same denial.
+
+The first half is correct. The second half was never tested, and it is false. **TCC
+grants filesystem access per binary**, so "a LaunchAgent is denied" does not generalise
+to "every process it spawns is denied". Probed from cron on 2026-08-25:
 
 ```
-bash: .../scripts/run_etl_daily.sh: Operation not permitted     # exit 126
+ls / head / bash   reading the repo   ->  Operation not permitted
+.venv/bin/python   reading the same   ->  OK, listed 24 entries
 ```
 
-Probed precisely — a LaunchAgent under `~/Documents` can `chdir` and `stat`, but
-cannot list a directory or read a file's contents. Executing a shell script requires
-reading it, so it is denied. Pointing the job straight at `.venv/bin/python` does not
-help either: Python would then need to read `src/etl/*.py`, same denial.
+`.venv/bin/python` is a symlink to `/Library/Frameworks/Python.framework/Versions/3.12`,
+the python.org framework build, which holds Full Disk Access. `/bin/bash` does not. So a
+local schedule can run the pipeline perfectly well — it simply cannot read a *shell
+script stored in the repo* to find out how, because bash is denied before its first
+line executes.
 
-The fixes were: move the repo out of `~/Documents`, grant Full Disk Access to
-`/bin/bash` (broad — every shell script on the machine), or run somewhere without TCC.
-CI was chosen. It also removes the "laptop was asleep" failure mode entirely.
+The fix is to keep the launcher outside `~/Documents` and let it hand every repo path
+to Python rather than to the shell. That is what `scripts/etl_cron.sh` does, and
+`make install-cron` installs it.
 
-`scripts/run_etl_daily.sh` is kept for **manual local runs**, where the terminal does
-hold Documents access. CI deliberately does not use it — see below.
+The lesson worth keeping: a permission probe that tests one binary has measured one
+binary. The original conclusion generalised from `/bin/bash` to "a laptop cannot do
+this" and cost the project a CI dependency it did not need.
 
 ## Why OIDC and not access keys
 
@@ -180,14 +196,14 @@ No `WMATA_API_KEY` is needed. The ETL never contacts WMATA — it reads static G
 the `static/` archive the collector maintains, precisely so historical data is never
 joined against a newer timetable.
 
-## 5. First run
+## 5. Running it
 
-Actions → **etl-daily** → Run workflow. Use `workflow_dispatch` rather than waiting for
-the 07:00 UTC schedule.
+Actions → **etl-daily** → Run workflow. `workflow_dispatch` is the only trigger now —
+there is no schedule to wait for.
 
-What a healthy first run looks like:
+What a healthy run looks like:
 
-- `Run tests` — 57 passed
+- `Run tests` — all green (202 at the time of writing; the count only ever grows)
 - `Verify identity and configuration` — prints the assumed role ARN, not a user
 - `Process outstanding service days` — either processes the outstanding dates or logs
   `nothing outstanding — up to date`. **The latter is success, not a no-op failure**: a
@@ -222,15 +238,12 @@ match this repo, or a missing `permissions: id-token: write` in the workflow.
 
 ## Operating notes
 
-**Scheduled workflows are disabled after 60 days of repository inactivity.** GitHub
-does this silently. For a project that goes quiet between pushes this is the most
-likely way the schedule dies, and nothing will alert you. Either push something
-occasionally or check the Actions tab monthly. The catch-up logic means recovery is
-just re-enabling and running once — but only while the source data survives its 90-day
-retention.
-
-**Scheduled runs can be delayed** by minutes to hours under GitHub load. Harmless here:
-the job processes whatever is outstanding rather than assuming it ran on time.
+**There is no schedule any more.** The `schedule:` block was removed on 2026-08-25, not
+commented out: GitHub also auto-disables scheduled workflows after 60 days of repository
+inactivity, so a dormant block would leave it genuinely ambiguous whether the daily run
+was off by choice or by neglect. Only `workflow_dispatch` remains. That 60-day
+auto-disable was, for the record, the failure mode this document used to warn about, and
+it is no longer relevant now that the schedule lives on the laptop.
 
 **Only one run at a time**, enforced by the `concurrency` group. A backlog catch-up can
 outlast the gap to the next firing, and two runs writing the same `service_date`
@@ -244,3 +257,33 @@ wrapper is for laptops; CI calls `python -m src.etl.catchup` directly.
 **Cost.** A rail service day is ~72 seconds of compute locally; the runner spends most
 of its time installing dependencies. Well inside the free tier at one run a day, and
 the pip cache keeps it that way.
+
+## Why the scheduled runs were failing
+
+Worth recording, because nothing in the workflow file hints at it:
+
+```
+ERROR: Cannot install -r requirements-dev.txt (line 70) and pyarrow==25.0.0
+       because these package versions have conflicting dependencies.
+```
+
+`streamlit==1.62.0` requires `pyarrow!=25.0.0,<26,>=7.0` — it excludes **exactly one
+release**, 25.0.0, and `requirements-dev.txt` pinned precisely that. pip cannot resolve
+the pair, so **Install dependencies** died before the ETL ran.
+
+The reason nobody noticed locally is the interesting part: the venv had **25.0.1**
+installed, which satisfies streamlit fine. The requirements file had drifted from the
+environment it was supposed to describe, and only a from-scratch resolve — which is all
+CI ever does — exercised the pin that was actually written down. `make check` runs
+against the installed venv, so it could not have caught this either.
+
+Fixed by pinning `pyarrow==25.0.1`, matching what the venv already had. Verify a clean
+resolve with:
+
+```bash
+pip install --dry-run --ignore-installed -r requirements-dev.txt
+```
+
+The laptop schedule is indifferent to any of this. But the requirements file being
+wrong in a way only CI can detect is a good argument for keeping the workflow around
+and running it occasionally, even though it no longer owns the schedule.

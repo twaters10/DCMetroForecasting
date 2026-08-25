@@ -28,7 +28,7 @@ pyspark==4.2.0
 # ETL avoids the Spark<->pandas bridge entirely (schedule frames go through
 # Parquet) precisely so that warning stays cosmetic.
 pandas==3.0.5
-pyarrow==25.0.0
+pyarrow==25.0.1
 
 # Same reasoning, one layer up: the feature modules (`baselines.py`,
 # `historical.py`, `safe.py`) import numpy directly rather than reaching it
