@@ -157,6 +157,13 @@ def build_journeys(
         ].copy()
         rows["origin_stop_id"] = ordered.loc[usable, "from_stop_id"]
         rows["destination_stop_id"] = destination[usable]
+        # The origin SEGMENT's downstream stop, which is not the journey's destination
+        # once the journey is longer than one segment. Carried because the `recent_*`
+        # features above are that segment's, and both serving and monitoring key the
+        # live conditions table on (origin_stop_id, first_leg_to) — see
+        # serving/inference.py. Without it, monitoring can only match single-segment
+        # journeys and reports the model's strongest feature as null on the rest.
+        rows["first_leg_to"] = ordered.loc[usable, "to_stop_id"]
         rows["origin_departure_ts"] = ordered.loc[usable, "actual_departure_ts"]
         rows["origin_stop_sequence"] = ordered.loc[usable, ORDER_COLUMN]
         rows["destination_stop_sequence"] = destination_stop_sequence[usable]

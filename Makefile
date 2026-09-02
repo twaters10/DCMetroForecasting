@@ -17,7 +17,7 @@ PROFILE := metro-pulse
 START   := 2026-08-07
 
 .DEFAULT_GOAL := help
-.PHONY: help etl features train publish retrain monitor transfers check register-hint ui install-cron uninstall-cron cron-log
+.PHONY: help etl features train publish retrain monitor dashboard transfers check register-hint ui install-cron uninstall-cron cron-log
 
 help:
 	@echo "make etl        - process outstanding service days, sync to S3"
@@ -25,7 +25,8 @@ help:
 	@echo "make train      - retrain both models and compare them"
 	@echo "make publish    - refresh the serving inputs (NEVER skip this)"
 	@echo "make retrain    - etl -> features -> train -> publish, failing fast"
-	@echo "make monitor    - score yesterday against ground truth, publish metrics"
+	@echo "make monitor    - score unpublished service days, publish metrics"
+	@echo "make dashboard  - (re)create the CloudWatch dashboard from code"
 	@echo "make transfers  - score composed two-leg predictions on real transfers"
 	@echo "make check      - tests, lint, format"
 	@echo "make ui         - launch the local Streamlit app over the endpoint"
@@ -67,7 +68,13 @@ register-hint:
 	@echo "  AWS_PROFILE=$(PROFILE) $(PY) -m src.serving.register"
 
 monitor:
-	AWS_PROFILE=$(PROFILE) $(PY) -m src.monitoring.report
+	AWS_PROFILE=$(PROFILE) $(PY) -m src.monitoring.report --catchup
+
+# Recreates the CloudWatch dashboard from src/monitoring/dashboard.py. Safe to re-run:
+# `put_dashboard` replaces the document wholesale, so this is also how you undo a
+# console edit someone made by hand.
+dashboard:
+	AWS_PROFILE=$(PROFILE) $(PY) -m src.monitoring.dashboard
 
 # Local only, and no AWS: it reads the journey table and the model straight from
 # disk. Run it after `train`, because it scores whatever `latest` points at.

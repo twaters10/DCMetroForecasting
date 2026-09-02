@@ -81,5 +81,18 @@ cd "$REPO" || { echo "FATAL: cannot chdir to $REPO" >> "$LOG_FILE"; exit 78; }
 status=0
 "$PYTHON" -u -m src.etl.catchup "$@" >> "$LOG_FILE" 2>&1 || status=$?
 
+# Score whatever the ETL has landed but not yet published. Driven by what is missing
+# rather than by this firing, so three of the four daily runs exit in under a second and
+# a day the ETL caught up late is still scored.
+#
+# Its status is recorded separately and deliberately does NOT feed `status`. The monitor
+# exits 2 when the model breaches a threshold, which is a finding about the model, not a
+# failed run — folding it into the ETL's status would make a healthy pipeline look
+# broken in exactly the log used to tell a real outage from a sleeping laptop.
+monitor_status=0
+"$PYTHON" -u -m src.monitoring.report --catchup >> "$LOG_FILE" 2>&1 || monitor_status=$?
+echo "monitor finished status=$monitor_status $(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  >> "$LOG_FILE"
+
 echo "cron run finished status=$status $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$LOG_FILE"
 exit "$status"
