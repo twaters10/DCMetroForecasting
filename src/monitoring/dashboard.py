@@ -65,6 +65,16 @@ def _search(metric: str, stat: str, *, segments: int | None = None) -> str:
 def build_body(region: str) -> dict:
     """The dashboard document. Pure — takes no AWS call, so it is testable."""
     return {
+        # Without this the console opens on the last THREE HOURS. Every metric here is
+        # one datapoint per service day stamped at noon UTC, so a three-hour window is
+        # empty every time except the few minutes after a publish — which reads as a
+        # broken dashboard and was exactly how this one looked. Two weeks matches both
+        # the backdating window and how far back SEARCH will match.
+        "start": "-P14D",
+        # Keep the widgets' own 86400 period rather than letting the console rescale
+        # it to the viewport; these are daily numbers and a sub-daily bucket is
+        # meaningless.
+        "periodOverride": "inherit",
         "widgets": [
             {
                 "type": "text",
@@ -253,7 +263,7 @@ def build_body(region: str) -> dict:
                     ],
                 },
             },
-        ]
+        ],
     }
 
 

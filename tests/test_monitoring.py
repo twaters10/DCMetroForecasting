@@ -513,3 +513,13 @@ def test_the_publishable_horizon_agrees_with_the_publish_guard(tmp_path, monkeyp
     now = datetime(2026, 9, 2, 18, tzinfo=UTC)
 
     assert report.outstanding_dates(marker=marker, now=now) == []
+
+
+def test_the_dashboard_opens_on_a_range_that_can_contain_a_datapoint():
+    """The console default is the last three hours. These metrics are one point per
+    service day at noon UTC, so that window is empty except for the minutes after a
+    publish — indistinguishable from a dashboard with no data at all."""
+    body = dashboard.build_body("us-east-1")
+
+    assert body["start"] == "-P14D"
+    assert body["periodOverride"] == "inherit"
