@@ -17,7 +17,7 @@ PROFILE := metro-pulse
 START   := 2026-08-07
 
 .DEFAULT_GOAL := help
-.PHONY: help etl features train publish retrain monitor dashboard transfers check register-hint ui install-cron uninstall-cron cron-log
+.PHONY: help etl features train publish retrain monitor dashboard transfers check register-hint compare registry ui install-cron uninstall-cron cron-log
 
 help:
 	@echo "make etl        - process outstanding service days, sync to S3"
@@ -28,6 +28,8 @@ help:
 	@echo "make monitor    - score unpublished service days, publish metrics"
 	@echo "make dashboard  - (re)create the CloudWatch dashboard from code"
 	@echo "make transfers  - score composed two-leg predictions on real transfers"
+	@echo "make compare    - this run vs the previous ones, on identical rows"
+	@echo "make registry   - list the registered versions and how they scored"
 	@echo "make check      - tests, lint, format"
 	@echo "make ui         - launch the local Streamlit app over the endpoint"
 	@echo "make install-cron   - schedule the daily ETL locally (replaces CI)"
@@ -60,12 +62,23 @@ retrain: etl features train publish register-hint
 # already gone the other way once: a retrain moved every absolute number in the wrong
 # direction while the ranking held, because the validation window changed. Read
 # `journeys.compare` before shipping anything.
-register-hint:
+register-hint: compare
 	@run=$$($(PY) -c "import json,pathlib; print(json.load(open(pathlib.Path('data/models/journey_duration/latest').resolve()/'manifest.json'))['run_id'])")
 	@echo ""
 	@echo "run $$run is built but NOT registered."
 	@echo "review the compare output above, then:"
 	@echo "  AWS_PROFILE=$(PROFILE) $(PY) -m src.serving.register"
+
+# Run over run, NOT approach vs approach — `journeys.compare` already does the latter.
+# `--rescore` is the whole point: each run graded itself on its own validation window,
+# so the recorded numbers are not comparable to each other. This re-scores the last
+# three runs on one common set of rows. Three, not all, because every extra run means
+# loading another booster over ~677k rows.
+compare:
+	$(PY) -m src.models.compare_runs --rescore --limit 3
+
+registry:
+	AWS_PROFILE=$(PROFILE) $(PY) -m src.models.compare_runs --registry
 
 monitor:
 	AWS_PROFILE=$(PROFILE) $(PY) -m src.monitoring.report --catchup

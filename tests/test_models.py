@@ -789,3 +789,94 @@ def test_coverage_interpolates_like_support():
     assert _bracketed(26, coverage) == 62.3
     assert _bracketed(24, coverage) == 64.2
     assert _bracketed(40, coverage) is None
+
+
+# ----------------------------------------------------------------- run comparison
+
+
+def _manifest(run_id, boundary, *, by_length=None, trustworthy=True, target="j_sec"):
+    """The slice of a manifest `compare_runs` reads. Not the whole thing."""
+    return {
+        "run_id": run_id,
+        "model_name": "journey_duration",
+        "target": target,
+        "trustworthy": trustworthy,
+        "training_data": {
+            "service_dates": ["2026-08-07", "2026-08-19"],
+            "split": {
+                "boundary_utc": boundary,
+                "train_rows": 10,
+                "validation_rows": 5,
+                "validation_days": ["2026-08-19"],
+            },
+        },
+        "best_iteration": 100,
+        "git": {"commit": "abcdef1234", "dirty": False},
+        "headline_metrics": {"by_length": by_length or []},
+    }
+
+
+def test_rescoring_refuses_a_model_that_trained_on_the_holdout():
+    """The whole point of the leakage guard: a later boundary means it may have seen
+    these rows, and grading it on them is a memory test, not a comparison."""
+    from src.models.compare_runs import _leakage_free
+
+    older = _manifest("old", "2026-08-17T18:00:00+00:00")
+    newer = _manifest("new", "2026-08-20T19:34:00+00:00")
+
+    assert _leakage_free(older, newer)[0] is True
+    allowed, reason = _leakage_free(newer, older)
+    assert allowed is False
+    assert "may have trained on these rows" in reason
+
+
+def test_runs_without_a_recorded_boundary_are_never_rescored():
+    """Absent provenance is not permission — it cannot be proven leakage-free."""
+    from src.models.compare_runs import _leakage_free
+
+    blank = {"training_data": {"split": {}}}
+    allowed, reason = _leakage_free(blank, _manifest("h", "2026-08-20T19:34:00+00:00"))
+    assert allowed is False
+    assert "boundary not recorded" in reason
+
+
+def test_differing_validation_windows_are_detected():
+    """A moved split boundary is exactly what makes two runs' metrics incomparable."""
+    from src.models.compare_runs import comparable
+
+    a = _manifest("a", "2026-08-17T18:00:00+00:00")
+    b = _manifest("b", "2026-08-20T19:34:00+00:00")
+    assert comparable([a, a]) is True
+    assert comparable([a, b]) is False
+
+
+def test_mae_reads_both_manifest_shapes_onto_one_axis():
+    """The two families record journey MAE under different keys; both must land on the
+    same axis or the comparison silently drops one of them."""
+    from src.models.compare_runs import mae_by_length
+
+    journey = _manifest(
+        "j", "x", by_length=[{"segments": 4, "mae_journey_model": 54.1}]
+    )
+    segment = {
+        "headline_metrics": {"journey_level": [{"segments": 4, "mae_sec": 61.9}]}
+    }
+    assert mae_by_length(journey) == {4: 54.1}
+    assert mae_by_length(segment) == {4: 61.9}
+    assert mae_by_length({"headline_metrics": {}}) == {}
+
+
+def test_interrupted_runs_are_skipped_not_compared(tmp_path):
+    """Training writes the manifest last, so a manifest-less directory is a run that
+    died partway — comparing it would invent a result it never produced."""
+    from src.models.compare_runs import load_runs
+
+    runs = tmp_path / "runs"
+    (runs / "2026-08-20T10-00-00Z").mkdir(parents=True)
+    (runs / "2026-08-20T10-00-00Z" / "manifest.json").write_text(
+        json.dumps(_manifest("2026-08-20T10-00-00Z", "2026-08-17T18:00:00+00:00"))
+    )
+    (runs / "2026-08-21T10-00-00Z").mkdir(parents=True)  # no manifest
+
+    loaded = load_runs(tmp_path)
+    assert [m["run_id"] for _, m in loaded] == ["2026-08-20T10-00-00Z"]
