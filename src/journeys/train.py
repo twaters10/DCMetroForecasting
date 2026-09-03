@@ -219,17 +219,29 @@ def by_length(frame: pd.DataFrame, columns: dict[str, str]) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("segments").reset_index(drop=True)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Separate from `main` so the flag wiring can be tested without fitting a model."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--journeys", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument(
         "--quantile",
         type=float,
+        nargs="?",
         default=None,
-        help=f"upper-quantile model instead of the median, e.g. {QUANTILE_ALPHA}",
+        # Bare `--quantile` means QUANTILE_ALPHA, so the Makefile does not have to
+        # restate 0.8 and cannot drift from it.
+        const=QUANTILE_ALPHA,
+        help=(
+            f"upper-quantile model instead of the median; bare flag uses "
+            f"{QUANTILE_ALPHA}"
+        ),
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO,

@@ -55,6 +55,11 @@ features:
 train:
 	AWS_PROFILE=$(PROFILE) $(PY) -m src.models.train
 	$(PY) -m src.journeys.train
+	# The p80 "arrive by" model, retrained WITH the median rather than by hand. It was
+	# by hand, and `register` bundles whatever `journey_duration_p80/latest` points at,
+	# so the median improved every retrain while the quantile beside it silently aged.
+	# Both are user-facing: the app shows them as the trip time and "Budget for".
+	$(PY) -m src.journeys.train --quantile
 	$(PY) -m src.journeys.compare
 
 # `stations` first: `publish` reads station_index.json and fails loudly if it is absent,

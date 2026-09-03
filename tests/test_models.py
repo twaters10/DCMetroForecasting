@@ -1007,3 +1007,55 @@ def test_model_quality_survives_a_manifest_with_no_lengths():
     )
     assert report["regression_metrics"] == {}
     assert report["metro_pulse"]["trustworthy"] is False
+
+
+# ----------------------------------------------------------------- arrive-by coherence
+
+
+class _StubBooster:
+    def __init__(self, value):
+        self.value = value
+
+    def predict(self, matrix):
+        return [self.value]
+
+
+class _StubArtifacts:
+    """Only the four attributes `_score` touches."""
+
+    def __init__(self, median, upper):
+        self.encoder_mapping = {}
+        self.columns = ["local_hour"]
+        self.booster = _StubBooster(median)
+        self.quantile_booster = None if upper is None else _StubBooster(upper)
+
+
+def test_an_arrive_by_below_the_median_is_dropped():
+    """The two boosters are independent models and nothing makes them agree. An
+    'arrive by' earlier than the typical duration is incoherent, and the app renders
+    them side by side — so it is omitted rather than shown or clamped."""
+    from src.serving.inference import _score
+
+    median, upper = _score(_StubArtifacts(840.0, 700.0), {"local_hour": 8})
+    assert median == 840.0
+    assert upper is None
+
+
+def test_a_coherent_arrive_by_is_kept():
+    from src.serving.inference import _score
+
+    median, upper = _score(_StubArtifacts(840.0, 1020.0), {"local_hour": 8})
+    assert (median, upper) == (840.0, 1020.0)
+    # Equal is coherent: no slack, but not a contradiction.
+    assert _score(_StubArtifacts(840.0, 840.0), {"local_hour": 8})[1] == 840.0
+
+
+def test_bare_quantile_flag_uses_the_declared_alpha():
+    """The Makefile passes `--quantile` with no value, so the flag must resolve to
+    QUANTILE_ALPHA rather than the Makefile restating 0.8 and drifting from it."""
+    from src.journeys.train import QUANTILE_ALPHA, build_parser
+
+    parser = build_parser()
+    assert parser.parse_args([]).quantile is None
+    assert parser.parse_args(["--quantile"]).quantile == QUANTILE_ALPHA
+    assert parser.parse_args(["--quantile", "0.95"]).quantile == 0.95

@@ -397,6 +397,30 @@ def _score(artifacts: Artifacts, row: dict) -> tuple[float, float | None]:
         if artifacts.quantile_booster is not None
         else None
     )
+
+    # The two boosters are INDEPENDENT models — different objectives, and nothing makes
+    # them agree. An "arrive by" earlier than the typical duration is incoherent on its
+    # face, and it is what a user would see: the app renders them side by side as
+    # "Budget for" and the trip time.
+    #
+    # Dropped rather than clamped. Clamping to the median produces a budget with no
+    # slack in it, presented as though it had some, and its coverage would be around 50%
+    # rather than the figure quoted beside it. Omitting `arrive_by_sec` is a path the
+    # response already supports — it is what happens when no quantile model shipped at
+    # all — so the median still answers, minus a number that cannot be characterised.
+    #
+    # Most likely where the p80 is already weakest: long journeys, where measured
+    # coverage falls to 62%. Logged because it means the two models are out of step,
+    # which is a packaging problem, not a per-request one.
+    if upper is not None and upper < predicted:
+        logger.warning(
+            "quantile prediction %.1fs is below the median %.1fs — dropping the "
+            "arrive-by estimate. The p80 and median models are out of step.",
+            upper,
+            predicted,
+        )
+        upper = None
+
     return predicted, upper
 
 
