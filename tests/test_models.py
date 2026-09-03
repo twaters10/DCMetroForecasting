@@ -880,3 +880,130 @@ def test_interrupted_runs_are_skipped_not_compared(tmp_path):
 
     loaded = load_runs(tmp_path)
     assert [m["run_id"] for _, m in loaded] == ["2026-08-20T10-00-00Z"]
+
+
+# ----------------------------------------------------------------- mlflow projection
+
+
+def test_metrics_flatten_from_both_manifest_shapes():
+    """Both model families must land on the same metric names, or the UI shows two
+    disjoint sets of runs that cannot be charted against each other."""
+    from src.models.mlflow_sync import _flatten_metrics
+
+    journey = _flatten_metrics(
+        {
+            "headline_metrics": {
+                "by_length": [
+                    {"segments": 4, "journeys": 10, "mae_journey_model": 54.1},
+                    {"segments": 17, "journeys": 30, "mae_journey_model": 143.7},
+                ]
+            }
+        }
+    )
+    segment = _flatten_metrics(
+        {"headline_metrics": {"journey_level": [{"segments": 4, "mae_sec": 61.9}]}}
+    )
+    assert journey["mae_segments_04"] == 54.1
+    assert segment["mae_segments_04"] == 61.9
+
+    # Journey-count weighted, not a flat mean: 10 journeys at 54.1 and 30 at 143.7.
+    assert journey["mae_weighted"] == pytest.approx((54.1 * 10 + 143.7 * 30) / 40)
+
+
+def test_metric_names_survive_prose_baseline_labels():
+    """The segment model's baseline labels are prose — 'segment x hour median (fitted
+    on train)'. MLflow rejects most of those characters."""
+    from src.models.mlflow_sync import _flatten_metrics
+
+    metrics = _flatten_metrics(
+        {"headline_metrics": {"segment_mae": {"model (bias-calibrated)": 24.9}}}
+    )
+    name = next(k for k in metrics if k.startswith("segment_mae."))
+    assert set(name) <= set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
+    )
+    assert metrics[name] == 24.9
+
+
+def test_the_split_window_is_carried_as_a_tag():
+    """Two runs' metrics are only comparable if graded on the same window, so the
+    window has to be visible in the UI beside the numbers."""
+    from src.models.mlflow_sync import _tags
+
+    tags = _tags(
+        {
+            "run_id": "r",
+            "model_name": "journey_duration",
+            "target": "j",
+            "trustworthy": False,
+            "training_data": {
+                "service_dates": ["2026-08-07", "2026-08-19"],
+                "split": {
+                    "boundary_utc": "2026-08-17T18:00:00+00:00",
+                    "validation_days": ["2026-08-17", "2026-08-19"],
+                },
+            },
+            "git": {"commit": "abc123", "dirty": True},
+        }
+    )
+    assert tags["metro_pulse.split_boundary"] == "2026-08-17T18:00:00+00:00"
+    assert tags["metro_pulse.validation_days"] == "2026-08-17..2026-08-19"
+    # A provisional score must never read as a validated one, in any surface.
+    assert tags["metro_pulse.trustworthy"] == "False"
+
+
+# ----------------------------------------------------------------- registry metrics
+
+
+def test_model_quality_weights_by_journey_count():
+    """Journeys are wildly uneven across lengths, so an unweighted mean would let the
+    32-segment bucket — 118 training examples — drag the headline around."""
+    from src.serving.register import model_quality
+
+    report = model_quality(
+        {
+            "run_id": "r",
+            "trustworthy": True,
+            "target": "journey_duration_sec",
+            "best_iteration": 10,
+            "git": {},
+            "training_data": {
+                "validation_rows": 40,
+                "service_dates": [],
+                "split": {},
+            },
+            "headline_metrics": {
+                "by_length": [
+                    {"segments": 1, "journeys": 30, "mae_journey_model": 20.0},
+                    {"segments": 32, "journeys": 10, "mae_journey_model": 600.0},
+                ]
+            },
+        }
+    )
+    metrics = report["regression_metrics"]
+    assert metrics["mae"]["value"] == pytest.approx((20.0 * 30 + 600.0 * 10) / 40)
+    # Per-length kept alongside: an aggregate hides a regression at one horizon.
+    assert metrics["mae_segments_01"]["value"] == 20.0
+    assert metrics["mae_segments_32"]["value"] == 600.0
+    # The flag rides along, outside the AWS schema, so nothing reads a provisional
+    # score as a validated one.
+    assert report["metro_pulse"]["trustworthy"] is True
+
+
+def test_model_quality_survives_a_manifest_with_no_lengths():
+    """The segment model's manifest has no `by_length`; registering must not explode."""
+    from src.serving.register import model_quality
+
+    report = model_quality(
+        {
+            "run_id": "r",
+            "trustworthy": False,
+            "target": "actual_duration_sec",
+            "best_iteration": 1,
+            "git": {},
+            "training_data": {"validation_rows": 0, "service_dates": [], "split": {}},
+            "headline_metrics": {},
+        }
+    )
+    assert report["regression_metrics"] == {}
+    assert report["metro_pulse"]["trustworthy"] is False

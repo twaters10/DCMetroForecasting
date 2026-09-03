@@ -32,6 +32,11 @@ data/
 # a model binary in git is a merge conflict waiting to happen.
 data/models/
 
+# MLflow's default local store, created by any `mlflow` invocation that does not pass
+# --backend-store-uri. The project's store lives in data/mlflow (already ignored via
+# data/) and is rebuildable by `src.models.mlflow_sync`.
+mlruns/
+
 # OS
 .DS_Store
 

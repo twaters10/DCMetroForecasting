@@ -16,8 +16,17 @@ PY      := .venv/bin/python
 PROFILE := metro-pulse
 START   := 2026-08-07
 
+# Derived, gitignored under `data/`, and rebuildable by `mlflow-sync` from the run
+# manifests — so it is deliberately not backed up or synced to S3. Artifacts are.
+MLFLOW_URI  := sqlite:///data/mlflow/tracking.db
+
+# NOT 5000, MLflow's default: macOS ControlCenter binds it for the AirPlay Receiver, so
+# `mlflow ui` dies with "Address already in use" on a stock Mac and the reason is not
+# obvious from the error.
+MLFLOW_PORT := 5555
+
 .DEFAULT_GOAL := help
-.PHONY: help etl features train publish retrain monitor dashboard transfers check register-hint compare registry ui install-cron uninstall-cron cron-log
+.PHONY: help etl features train publish retrain monitor dashboard transfers check register-hint compare registry mlflow mlflow-sync ui install-cron uninstall-cron cron-log
 
 help:
 	@echo "make etl        - process outstanding service days, sync to S3"
@@ -30,6 +39,7 @@ help:
 	@echo "make transfers  - score composed two-leg predictions on real transfers"
 	@echo "make compare    - this run vs the previous ones, on identical rows"
 	@echo "make registry   - list the registered versions and how they scored"
+	@echo "make mlflow     - browse every run in the MLflow UI (syncs first)"
 	@echo "make check      - tests, lint, format"
 	@echo "make ui         - launch the local Streamlit app over the endpoint"
 	@echo "make install-cron   - schedule the daily ETL locally (replaces CI)"
@@ -79,6 +89,18 @@ compare:
 
 registry:
 	AWS_PROFILE=$(PROFILE) $(PY) -m src.models.compare_runs --registry
+
+# Sync before launching, always: the UI reading a store that is missing the run you just
+# trained is the one failure mode that would make anyone distrust it. The sync is
+# idempotent and skips everything already logged, so this costs seconds.
+#
+# `mlflow-sync` is separately callable, but there is deliberately no way to launch the
+# UI *without* syncing.
+mlflow: mlflow-sync
+	$(PY) -m mlflow ui --backend-store-uri $(MLFLOW_URI) --port $(MLFLOW_PORT)
+
+mlflow-sync:
+	AWS_PROFILE=$(PROFILE) $(PY) -m src.models.mlflow_sync --registry
 
 monitor:
 	AWS_PROFILE=$(PROFILE) $(PY) -m src.monitoring.report --catchup

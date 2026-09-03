@@ -69,6 +69,14 @@ openpyxl==3.1.5
 # which keeps "the only managed compute is the collector Lambda and the endpoint" true.
 streamlit==1.62.0
 
+# Run comparison, browsed locally for the same reason Streamlit is: SageMaker offers a
+# managed MLflow tracking server, but it bills by the hour to host a UI one person opens
+# after a retrain. The tracking store is a derived view — `models/mlflow_sync` rebuilds
+# it from the run manifests — so hosting it would buy durability that is not needed and
+# would put a third thing in "the only managed compute is the collector Lambda and the
+# endpoint". Artifacts still go to S3.
+mlflow==3.15.1
+
 black
 ruff
 
