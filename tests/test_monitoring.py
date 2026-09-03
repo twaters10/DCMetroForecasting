@@ -421,7 +421,8 @@ def _day_with_one_long_journey():
 
 def _conditions_snapshot():
     return {
-        NOON - timedelta(minutes=2): pd.DataFrame(
+        NOON
+        - timedelta(minutes=2): pd.DataFrame(
             [
                 {
                     "from_stop_id": "PF_A01_1",
