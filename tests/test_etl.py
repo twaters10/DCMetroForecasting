@@ -10,6 +10,8 @@ pipeline on real data. Those are marked REGRESSION.
 
 from __future__ import annotations
 
+import shutil
+import zipfile
 from datetime import UTC, date, datetime, timedelta
 
 import pyarrow as pa
@@ -24,8 +26,8 @@ from fixtures_gtfs_rt import (
     vehicle_positions,
 )
 
-from src.etl.archive import Snapshot
-from src.etl.config import SERVICE_TZ
+from src.etl.archive import Snapshot, resolve_static_bundle
+from src.etl.config import SERVICE_TZ, EtlConfig
 from src.etl.decode import (
     TRIP_UPDATE_SCHEMA,
     VEHICLE_POSITION_SCHEMA,
@@ -933,3 +935,163 @@ def test_staging_reads_are_restricted_to_the_decoded_window(tmp_path):
     # Half-open [start, end): the upper bound belongs to the NEXT window, and counting
     # it in both would double-count one snapshot across consecutive runs.
     assert sorted(kept["trip_id"]) == ["T1", "T2"]
+
+
+# --------------------------------------------------------------------------
+# archive.py — static bundle resolution
+# --------------------------------------------------------------------------
+
+
+def _bundle_zip(path, version, feed_start, feed_end, trip_ids=("11968412",)):
+    """A minimal but structurally real bundle, versioned the way WMATA versions them."""
+    trips = "route_id,trip_id,scheduled_trip_id,direction_id\n" + "".join(
+        f"RED,{t}_{version},{t},0\n" for t in trip_ids
+    )
+    members = {
+        "trips.txt": trips,
+        "stop_times.txt": "trip_id,stop_id,stop_sequence,arrival_time,departure_time\n",
+        "stops.txt": "stop_id,stop_name\n",
+        "routes.txt": "route_id,route_short_name\n",
+        "feed_info.txt": (
+            "feed_publisher_name,feed_start_date,feed_end_date\n"
+            f"WMATA,{feed_start},{feed_end}\n"
+        ),
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, body in members.items():
+            archive.writestr(name, body)
+    return path
+
+
+class _FakeS3:
+    """Just enough S3 for bundle resolution: one listing and local file copies."""
+
+    def __init__(self, objects):
+        self.objects = objects  # key -> (local path, LastModified)
+        self.downloaded = []
+
+    def get_paginator(self, _operation):
+        contents = [
+            {"Key": key, "Size": path.stat().st_size, "LastModified": modified}
+            for key, (path, modified) in self.objects.items()
+        ]
+        # S3 lists lexicographically by key. Reproducing that is the whole point: the
+        # bug this guards against was the resolver inheriting that order as its
+        # tiebreak.
+        contents.sort(key=lambda entry: entry["Key"])
+
+        class _Paginator:
+            @staticmethod
+            def paginate(**_kwargs):
+                return [{"Contents": contents}]
+
+        return _Paginator()
+
+    def download_file(self, _bucket, key, destination):
+        self.downloaded.append(key)
+        shutil.copyfile(self.objects[key][0], destination)
+
+
+def _republished_window(tmp_path):
+    """The real 2026-09 shape: one feed window, two bundles, a version bump between.
+
+    WMATA republished 20700 as 20705 on 2026-09-14 without moving `feed_start_date`
+    or `feed_end_date`. The content hashes put the SUPERSEDED bundle first
+    lexicographically, so any resolver that inherits S3's key order picks the wrong one.
+    """
+    prefix = "static/rail/feed_start=20260908/feed_end=20260918"
+    old_key = f"{prefix}/rail-gtfs-static-0c0612003861.zip"
+    new_key = f"{prefix}/rail-gtfs-static-181df74e702d.zip"
+    return {
+        old_key: (
+            _bundle_zip(tmp_path / "old.zip", "20700", "20260908", "20260918"),
+            datetime(2026, 9, 8, 8, 0, tzinfo=UTC),
+        ),
+        new_key: (
+            _bundle_zip(tmp_path / "new.zip", "20705", "20260908", "20260918"),
+            datetime(2026, 9, 14, 8, 0, tzinfo=UTC),
+        ),
+    }
+
+
+def _config(tmp_path):
+    return EtlConfig(
+        s3_bucket="test-bucket",
+        raw_prefix="raw/",
+        static_prefix="static/",
+        processed_prefix="processed/",
+        cache_dir=tmp_path / "cache",
+        aws_region="us-east-1",
+    )
+
+
+def test_realtime_versions_choose_between_bundles_in_one_feed_window(tmp_path):
+    """REGRESSION: a mid-window republication collapsed the match rate to 35%.
+
+    Both bundles cover 2026-09-12 and share a feed window, so the window cannot pick
+    between them. The realtime feed was emitting 20705 exclusively; resolving to 20700
+    joined every row against a timetable that had already been superseded.
+    """
+    s3 = _FakeS3(_republished_window(tmp_path))
+
+    bundle = resolve_static_bundle(
+        s3,
+        _config(tmp_path),
+        "rail",
+        "2026-09-12",
+        realtime_versions={"20705": 3_579_576},
+    )
+
+    assert bundle.schedule_version == "20705"
+
+
+def test_bundle_resolution_falls_back_to_the_newest_archive(tmp_path):
+    """With no realtime versions to go on, recency is the only defensible proxy.
+
+    Not merely deterministic — the content hash was deterministic too, and wrong. The
+    later archive is the one that superseded the other.
+    """
+    s3 = _FakeS3(_republished_window(tmp_path))
+
+    bundle = resolve_static_bundle(s3, _config(tmp_path), "rail", "2026-09-12")
+
+    assert bundle.schedule_version == "20705"
+
+
+def test_bundle_resolution_ignores_a_version_no_bundle_carries(tmp_path):
+    """A version the archive never captured must not leave the run with nothing.
+
+    The collector can miss a republication entirely. Falling through to the newest
+    covering bundle keeps the run going with a schedule that is merely stale — which
+    the match-rate report then flags — rather than failing to resolve at all.
+    """
+    s3 = _FakeS3(_republished_window(tmp_path))
+
+    bundle = resolve_static_bundle(
+        s3,
+        _config(tmp_path),
+        "rail",
+        "2026-09-12",
+        realtime_versions={"20710": 1_000},
+    )
+
+    assert bundle.schedule_version == "20705"
+
+
+def test_bundle_resolution_prefers_a_covering_window_over_a_newer_archive(tmp_path):
+    """Tier 1 still beats tier 2: the tiebreak only applies WITHIN a tier.
+
+    A bundle archived later but whose window ends before the service date describes a
+    different fortnight, and must not win on recency alone.
+    """
+    objects = _republished_window(tmp_path)
+    later = "static/rail/feed_start=20260919/feed_end=20260929/rail-gtfs-static-ff.zip"
+    objects[later] = (
+        _bundle_zip(tmp_path / "future.zip", "20710", "20260919", "20260929"),
+        datetime(2026, 9, 19, 8, 0, tzinfo=UTC),
+    )
+    s3 = _FakeS3(objects)
+
+    bundle = resolve_static_bundle(s3, _config(tmp_path), "rail", "2026-09-12")
+
+    assert bundle.schedule_version == "20705"

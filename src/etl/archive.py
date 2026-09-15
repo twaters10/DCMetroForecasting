@@ -19,12 +19,13 @@ in force. See docs/static-gtfs.md.
 
 from __future__ import annotations
 
+import csv
 import gzip
 import io
 import re
 import zipfile
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -264,6 +265,14 @@ def list_static_bundles(
 
     Reads the feed window straight out of the key, so choosing a bundle costs one
     list call and no downloads — the reason the collector puts it there.
+
+    Ties on the feed window are broken by archive time, newest first. That tiebreak
+    is load-bearing: WMATA republishes a timetable *inside* an unchanged window
+    (20700 -> 20705 under `feed_start=20260908/feed_end=20260918`, archived
+    2026-09-14), so two bundles sharing a `feed_start_date` is normal rather than
+    exceptional. Sorting on the window alone left the winner to S3's lexicographic
+    key order — that is, to the content hash — which is arbitrary and picked the
+    superseded bundle.
     """
     prefix = f"{config.static_prefix}{mode}/"
     bundles: list[dict[str, str]] = []
@@ -280,9 +289,14 @@ def list_static_bundles(
                     "feed_start_date": match.group(1),
                     "feed_end_date": match.group(2),
                     "size": str(obj["Size"]),
+                    "archived_at": obj["LastModified"].isoformat(),
                 }
             )
-    return sorted(bundles, key=lambda b: b["feed_start_date"], reverse=True)
+    return sorted(
+        bundles,
+        key=lambda b: (b["feed_start_date"], b["archived_at"]),
+        reverse=True,
+    )
 
 
 def fetch_static_bundle(s3: S3Client, config: EtlConfig, key: str) -> Path:
@@ -303,6 +317,62 @@ def fetch_static_bundle(s3: S3Client, config: EtlConfig, key: str) -> Path:
     s3.download_file(config.s3_bucket, key, str(staging))
     staging.replace(destination)
     return destination
+
+
+def _version_from_trip_id(trip_id: str) -> str | None:
+    """`11968412_20705` -> `20705`; None for an id carrying no suffix."""
+    parts = trip_id.rsplit("_", 1)
+    return parts[1] if len(parts) == 2 else None
+
+
+def _peek_schedule_version(path: Path) -> str | None:
+    """A bundle's version suffix, read without parsing its other tables.
+
+    Selection happens before the chosen bundle is loaded, so this runs on candidates
+    that will mostly be discarded. `stop_times.txt` is by far the largest member of
+    the zip — around 40x `trips.txt` — and parsing one just to read a suffix off its
+    first trip would cost seconds per candidate for nothing.
+    """
+    with zipfile.ZipFile(path) as archive, archive.open("trips.txt") as handle:
+        reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8-sig"))
+        row = next(reader, None)
+    if row is None:
+        return None
+    return _version_from_trip_id(str(row.get("trip_id", "")))
+
+
+def _choose_bundle(
+    s3: S3Client,
+    config: EtlConfig,
+    candidates: list[dict[str, str]],
+    realtime_versions: Mapping[str, int] | None,
+) -> dict[str, str]:
+    """Pick one of several bundles that all cover the service date.
+
+    `candidates` arrives newest-archived first, and that order is the answer whenever
+    the realtime feed cannot settle it. But it is only a proxy, and a lossy one: a
+    bundle archived after a mid-window republication did not describe the *earlier*
+    days of that same window, so reprocessing an old date would silently join it
+    against a timetable that was never in force on it.
+
+    The realtime `trip_id` suffixes say which version actually ran. When the caller
+    has them, they decide, and the archive-time proxy is only the fallback for the
+    case where no archived bundle carries the version the feed was emitting.
+    """
+    tally = {
+        version: count
+        for version, count in (realtime_versions or {}).items()
+        if version and version != "None"
+    }
+    if not tally or len(candidates) == 1:
+        return candidates[0]
+
+    wanted = max(tally, key=lambda version: tally[version])
+    for candidate in candidates:
+        path = fetch_static_bundle(s3, config, candidate["key"])
+        if _peek_schedule_version(path) == wanted:
+            return candidate
+    return candidates[0]
 
 
 def load_static_bundle(path: Path, key: str = "") -> StaticBundle:
@@ -329,8 +399,7 @@ def load_static_bundle(path: Path, key: str = "") -> StaticBundle:
     # than crashing the run.
     version: str | None = None
     if not trips.empty:
-        candidate = str(trips["trip_id"].iloc[0]).rsplit("_", 1)
-        version = candidate[1] if len(candidate) == 2 else None
+        version = _version_from_trip_id(str(trips["trip_id"].iloc[0]))
 
     return StaticBundle(
         key=key or str(path),
@@ -345,7 +414,11 @@ def load_static_bundle(path: Path, key: str = "") -> StaticBundle:
 
 
 def resolve_static_bundle(
-    s3: S3Client, config: EtlConfig, mode: str, service_date: str | None = None
+    s3: S3Client,
+    config: EtlConfig,
+    mode: str,
+    service_date: str | None = None,
+    realtime_versions: Mapping[str, int] | None = None,
 ) -> StaticBundle:
     """Pick, cache and parse the bundle to join a service date against.
 
@@ -361,6 +434,14 @@ def resolve_static_bundle(
     That is not detectable from the feed window alone — the realtime feed lags the
     static one — so the caller must compare `schedule_version` against the suffix on
     the realtime `trip_id`s and report any disagreement.
+
+    A feed window does not identify a bundle: WMATA republishes within one, and
+    several archived bundles routinely satisfy the same tier above. `realtime_versions`
+    — a tally of the version suffixes the feed was actually emitting, as produced by
+    `MatchRateReport.realtime_versions` — settles that, and passing it is strongly
+    preferred. Without it the choice falls back to whichever covering bundle was
+    archived most recently, which is right for a date processed promptly and wrong
+    for one reprocessed after a later republication.
     """
     bundles = list_static_bundles(s3, config, mode)
     if not bundles:
@@ -381,10 +462,9 @@ def resolve_static_bundle(
             and (b["feed_end_date"] == "unknown" or compact <= b["feed_end_date"])
         ]
         earlier = [b for b in bundles if b["feed_start_date"] <= compact]
-        if covering:
-            chosen = covering[0]
-        elif earlier:
-            chosen = earlier[0]
+        candidates = covering or earlier
+        if candidates:
+            chosen = _choose_bundle(s3, config, candidates, realtime_versions)
 
     path = fetch_static_bundle(s3, config, chosen["key"])
     return load_static_bundle(path, key=chosen["key"])

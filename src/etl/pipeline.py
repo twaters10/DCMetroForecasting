@@ -41,6 +41,7 @@ from .decode import decode_feed
 from .quality import QualityReport, check_segments, check_snapshot_coverage
 from .schedule import (
     build_match_report,
+    schedule_version,
     scheduled_stop_times,
     service_day_end,
     service_day_start,
@@ -194,8 +195,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- Static schedule and match rate (step 2) ----
     service_date = local_start.date().isoformat()
-    bundle = resolve_static_bundle(s3, config, args.mode, service_date)
-    logger.info("static bundle %s (version %s)", bundle.key, bundle.schedule_version)
 
     # Same window restriction as stage B, and for the same reason. Read unfiltered,
     # this statistic covers every date staged rather than the one being processed: on
@@ -211,6 +210,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         .to_pandas()
     )
+
+    # Which timetable actually ran, straight from the realtime trip_id suffixes. Read
+    # BEFORE the bundle is resolved, not after, because it is what decides *which*
+    # bundle to resolve when several cover the service date — WMATA republishes inside
+    # a feed window, and the window alone cannot tell the versions apart.
+    realtime_versions = (
+        observations_for_report.dropna(subset=["trip_id"])["trip_id"]
+        .map(schedule_version)
+        .value_counts()
+        .to_dict()
+    )
+
+    bundle = resolve_static_bundle(
+        s3,
+        config,
+        args.mode,
+        service_date,
+        realtime_versions={str(k): int(v) for k, v in realtime_versions.items()},
+    )
+    logger.info("static bundle %s (version %s)", bundle.key, bundle.schedule_version)
+
     match_report = build_match_report(observations_for_report, bundle)
 
     schedule_frame = scheduled_stop_times(bundle)

@@ -48,6 +48,7 @@ from .config import (
     SERVICE_TZ,
     EtlConfig,
 )
+from .schedule import schedule_version
 
 _VEHICLE_STATUS = gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus
 _SCHEDULE_RELATIONSHIP = (
@@ -595,7 +596,20 @@ def main(argv: list[str] | None = None) -> int:
     tu_frame = report_trip_updates_census(tu_snaps)
 
     service_date = local_start.date().isoformat()
-    bundle = resolve_static_bundle(s3, config, args.mode, service_date)
+    # Resolved with the realtime versions, exactly as the pipeline does it. Without
+    # them this would report a different timetable than the run will actually use
+    # whenever several archived bundles cover the date — which defeats the point of
+    # looking before processing.
+    rt_versions = Counter(
+        version
+        for version in tu_frame.dropna(subset=["trip_id"])["trip_id"].map(
+            schedule_version
+        )
+        if version
+    )
+    bundle = resolve_static_bundle(
+        s3, config, args.mode, service_date, realtime_versions=dict(rt_versions)
+    )
     report_static_join(tu_frame, bundle, args.mode)
 
     report_arrival_derivation(vp_frame, tu_frame, args.end)
