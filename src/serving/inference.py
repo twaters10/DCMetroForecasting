@@ -365,6 +365,9 @@ def _feature_row(artifacts: Artifacts, journey: dict, when: pd.Timestamp) -> dic
         "stops_spanned": journey["stops_spanned"],
         "route_id": journey["route_id"],
         "direction_id": journey["direction_id"],
+        # A model feature as well as the conditions key below: the journeys table has
+        # carried it since 90a5249 and `journeys.train` does not exclude it.
+        "first_leg_to": journey["first_leg_to"],
         "from_station": journey["origin_stop_id"][3:6],
         "to_station": journey["destination_stop_id"][3:6],
         **_calendar_features(when),

@@ -1,7 +1,10 @@
 # metro-pulse-forecast
 
-Forecasting WMATA (Washington DC Metro rail and bus) trip duration and congestion
-from a self-built historical archive.
+Forecasting WMATA (Washington DC Metrorail) trip duration and congestion from a
+self-built historical archive.
+
+**Rail only.** Bus is out of scope — not a later stage, not a stretch goal. Every
+measurement, feature and model here is rail.
 
 WMATA publishes real-time data but no historical archive of actual trip times, so
 this project starts by building its own dataset: a collector Lambda polls the
